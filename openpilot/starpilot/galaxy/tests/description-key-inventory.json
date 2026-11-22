@@ -104,6 +104,7 @@
   "ShowCSCStatus",
   "ShowSpeedLimits",
   "SignalMetrics",
+  "SmoothStops",
   "SoundPack",
   "SpeedLimitController",
   "StandardFollow",

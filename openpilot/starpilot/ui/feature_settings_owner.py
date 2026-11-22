@@ -26,6 +26,7 @@ from openpilot.starpilot.longitudinal.accel_profile import A_CRUISE_MAX_VALS_TRA
 from openpilot.starpilot.longitudinal.profile_runtime import TRAFFIC_CRUISE_BRAKE_MAGNITUDE
 from openpilot.starpilot.longitudinal.lead_approach_runtime import KEY as LEAD_APPROACH_KEY
 from openpilot.starpilot.longitudinal.lead_takeoff_preferences import KEY as LEAD_TAKEOFF_KEY
+from openpilot.starpilot.longitudinal.smooth_stops_preferences import KEY as SMOOTH_STOPS_KEY, supported as smooth_stops_supported
 from openpilot.starpilot.longitudinal.encouragement import KEY as NUDGE_KEY
 from openpilot.selfdrive.car.cruise import LOW_SPEED_CRUISE_ON_SET
 from openpilot.starpilot.longitudinal.planner_selection import KEY as PLANNER_SELECTION_KEY, save_selection
@@ -87,8 +88,10 @@ from openpilot.starpilot.controllers.toyota_cruise import capability as toyota_c
 AGGRESSIVE_COOLING_KEY = "AggressiveCoolingEnabled"
 AGGRESSIVE_COOLING_DESCRIPTION = ("Runs the fan sooner and harder to keep the comma 10-16 °C (18-29 °F) cooler on hot days, " +
                                   "at the cost of more fan noise. Applies next drive.")
-GLOBAL_BOOL_PREFERENCES = frozenset((LEAD_APPROACH_KEY, LEAD_TAKEOFF_KEY, NUDGE_KEY, LOW_SPEED_CRUISE_ON_SET,
+GLOBAL_BOOL_PREFERENCES = frozenset((LEAD_APPROACH_KEY, LEAD_TAKEOFF_KEY, NUDGE_KEY, LOW_SPEED_CRUISE_ON_SET, SMOOTH_STOPS_KEY,
                                      "DisengageOnAccelerator", AGGRESSIVE_COOLING_KEY))
+SMOOTH_STOPS_DESCRIPTION = ("Eases off the brakes in the last few feet of a stop so the car settles to a halt instead of lurching. " +
+                            "Stops take a moment longer and end slightly farther forward. Supported Hyundai, Kia and Genesis vehicles.")
 
 
 def cooling_available() -> bool:
@@ -113,6 +116,7 @@ BOOL_DEFAULTS = {
   "CustomPersonalities": False, PLANNER_SELECTION_KEY: True,
   LEAD_APPROACH_KEY: False,
   LEAD_TAKEOFF_KEY: False,
+  SMOOTH_STOPS_KEY: False,
   NUDGE_KEY: True,
   LOW_SPEED_CRUISE_ON_SET: False,
   "DisengageOnAccelerator": False,
@@ -1267,6 +1271,10 @@ class FeatureSettingsOwner:
       offset_row = self._number_row("ForceStopDistanceOffset", "Stop Distance Adjustment", allowed and force_enabled == "1")
       rows.append(replace(offset_row, default_reset_available=allowed and parked and offset_row.step > 0,
                           reason="Positive values stop farther forward; negative values stop earlier"))
+      vehicle_cp = self.vehicle_params()
+      if vehicle_cp is not None and smooth_stops_supported(vehicle_cp):
+        rows.append(self._bool_row(SMOOTH_STOPS_KEY, "Smooth Stops", self.authority("preferences") and self.longitudinal_available(),
+                                   reason=SMOOTH_STOPS_DESCRIPTION))
       approach_row = self._bool_row(LEAD_APPROACH_KEY, "Approaching lead buffer",
                                     self.authority("preferences"),
                                     reason="Gradually adds following distance when approaching a slower or braking lead")

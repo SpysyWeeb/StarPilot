@@ -66,6 +66,8 @@ DESCRIPTIONS = {
   'ReverseCruise': 'Swaps the Toyota short-press and held-press cruise-speed increments.',
   'ForceStops': 'Improves stopping behavior at traffic lights and enables automatic stopping at detected stop signs. Press the accelerator to continue.',
   'ForceStopDistanceOffset': 'Moves the planned stopping point. Positive values stop farther forward; negative values stop earlier.',
+  'SmoothStops': ('Eases off the brakes in the last few feet of a stop so the car settles to a halt instead of lurching. ' +
+                  'Stops take a moment longer and end slightly farther forward. Supported Hyundai, Kia and Genesis vehicles.'),
   'LeadApproachBuffer': 'Gradually adds following distance when approaching a slower or braking lead vehicle.',
   'LowSpeedCruiseOnSet': ('Uses the vehicle’s minimum engagement speed as the floor when pressing SET with StarPilot cruise. ' +
                          'SET uses your current speed when you are above that floor.'),
