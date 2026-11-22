@@ -43,6 +43,7 @@ from openpilot.starpilot.car.ford.stopped_lead import owner_for as ford_stop_own
 from openpilot.starpilot.car.volkswagen.stopped_lead import owner_for as vw_stop_owner
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import STOP_DISTANCE
 from openpilot.starpilot.longitudinal.lead_approach import LeadApproach, LeadApproachKey, project as project_approach
+from openpilot.starpilot.longitudinal.smooth_stops import owner_for as smooth_stops_owner
 from openpilot.starpilot.lateral.lane_change_preferences import LaneChangePolicy
 
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
@@ -156,6 +157,7 @@ class LongitudinalPlanner:
     self.vision_stop_buffer = vision_stop_owner(CP)
     self.ford_stop_approach = ford_stop_owner(CP, STOP_DISTANCE - .5) or vw_stop_owner(CP, STOP_DISTANCE - .5)
     self.preap_adaptive = preap_adaptive_owner(CP)
+    self.smooth_stops = smooth_stops_owner(CP, dt, (A_CRUISE_MAX_BP, J_CRUISE_VALS))
 
   def update(self, sm, *, cruise_ceiling: CruiseCeiling | None = None,
              profile_tuning: ProfileTuning | None = None, curve_ceiling: CurveCeiling | None = None,
@@ -166,7 +168,8 @@ class LongitudinalPlanner:
              lead_approach_key: LeadApproachKey | None = None,
              force_stop_provider: Callable[[float], StopPlan] | None = None,
              faster_lead_takeoff: bool = False, takeoff_drive_id: int = 0,
-             now_ns: int | None = None, drive_id: int = 0, wheel_coast=None, experimental_speed_nudge: bool = True):
+             now_ns: int | None = None, drive_id: int = 0, wheel_coast=None, experimental_speed_nudge: bool = True,
+             smooth_stops: bool = False):
     if curve_ceiling is not None and curve_provider is not None:
       raise ValueError('choose explicit Curve ceiling or same-cycle provider')
     if self.plan_drive_id != drive_id:
@@ -505,6 +508,12 @@ class LongitudinalPlanner:
         target=float(output_a_target), previous_target=float(a_prev), follow_seconds=float(self.mpc.params[0, 4]),
         blocked=bool(self.output_should_stop or self.fcw or self.force_stop_plan.forcing or
                      self.force_stop_plan.approach_distance_m > 0 or self.mpc.solution_status != 0))
+    if self.smooth_stops is not None:
+      # Enhanced Stops, forceDecel and FCW keep their own stop; the vision stop buffer below can still add braking and the stop bit
+      output_a_target, self.output_should_stop = self.smooth_stops.sample(
+        sm, target=output_a_target, stopping=self.output_should_stop, enabled=smooth_stops, plan_speeds=self.mpc.v_solution,
+        active=profile_eligible and not reset_state and not self.fcw and not sm['controlsState'].forceDecel and
+               not self.force_stop_plan.forcing)
     if self.vision_stop_buffer is not None:
       output_a_target, self.output_should_stop = self.vision_stop_buffer.sample(
         sm, now_ns=sample_now_ns, drive_id=drive_id, target=float(output_a_target),

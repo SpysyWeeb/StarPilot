@@ -19,6 +19,7 @@ from openpilot.starpilot.longitudinal.lane_change_gap import LaneGapPreferences
 from openpilot.starpilot.longitudinal.experimental_release import ConditionalHandoff
 from openpilot.starpilot.longitudinal.lead_approach import LeadApproachKey
 from openpilot.starpilot.longitudinal.lead_takeoff_preferences import TakeoffPreferences
+from openpilot.starpilot.longitudinal.smooth_stops_preferences import SmoothStopsPreferences
 from openpilot.starpilot.longitudinal.encouragement import NudgePreferences
 from openpilot.starpilot.longitudinal.force_stop_runtime import ForceStopRuntime
 from openpilot.starpilot.longitudinal.stop_resume import collect_resume
@@ -232,14 +233,16 @@ def update_curve_frame(planner: LongitudinalPlanner, sm, CP, now_ns: int, *, hos
                        event: CurveDriverEvent | None = None, lane_change_policy=None,
                        global_braking_response: str | None = None, selected_profiles=None, conditional_handoff: ConditionalHandoff | None = None,
                        lead_approach_key: LeadApproachKey | None = None, force_stop_provider=None,
-                       faster_lead_takeoff: bool = False, wheel_coast=None, experimental_speed_nudge: bool = True):
+                       faster_lead_takeoff: bool = False, wheel_coast=None, experimental_speed_nudge: bool = True,
+                       smooth_stops: bool = False):
   """One model cycle: MPC chooses follow time, then Curve samples and receives winner feedback."""
   if host is None:
     planner.update(sm, cruise_ceiling=cruise_ceiling, profile_tuning=profile_tuning, traffic_mode=traffic_mode,
                    lane_change_policy=lane_change_policy, global_braking_response=global_braking_response, selected_profiles=selected_profiles,
                    conditional_handoff=conditional_handoff, lead_approach_key=lead_approach_key,
                    force_stop_provider=force_stop_provider, faster_lead_takeoff=faster_lead_takeoff, wheel_coast=wheel_coast,
-                   takeoff_drive_id=drive_id, now_ns=now_ns, drive_id=drive_id, experimental_speed_nudge=experimental_speed_nudge)
+                   takeoff_drive_id=drive_id, now_ns=now_ns, drive_id=drive_id, experimental_speed_nudge=experimental_speed_nudge,
+                   smooth_stops=smooth_stops)
     return None
   results = []
   def provider(follow_time_s: float | None):
@@ -252,7 +255,8 @@ def update_curve_frame(planner: LongitudinalPlanner, sm, CP, now_ns: int, *, hos
                  curve_provider=provider, traffic_mode=traffic_mode, lane_change_policy=lane_change_policy,
                  global_braking_response=global_braking_response, selected_profiles=selected_profiles, conditional_handoff=conditional_handoff,
                  lead_approach_key=lead_approach_key, force_stop_provider=force_stop_provider, faster_lead_takeoff=faster_lead_takeoff, wheel_coast=wheel_coast,
-                   takeoff_drive_id=drive_id, now_ns=now_ns, drive_id=drive_id, experimental_speed_nudge=experimental_speed_nudge)
+                   takeoff_drive_id=drive_id, now_ns=now_ns, drive_id=drive_id, experimental_speed_nudge=experimental_speed_nudge,
+                   smooth_stops=smooth_stops)
   confirm_curve_frame(host, planner, now_ns)
   return results[0] if results else None
 
@@ -347,6 +351,7 @@ def starpilot_main():
   curve_status = CurveStatusPublisher() if curve_host is not None else None
   force_stop_owner = ForceStopRuntime(params) if CP.openpilotLongitudinalControl else None
   takeoff_preferences = TakeoffPreferences(params) if CP.openpilotLongitudinalControl else None
+  smooth_stops_preferences = SmoothStopsPreferences(params) if longitudinal_planner.smooth_stops is not None else None
   stop_resume_sock = messaging.sub_sock("carState", conflate=False) if force_stop_owner is not None else None
   conditional_host = (ConditionalPlannerHost(params, enabled_scene_owners=(frozenset({'traffic_mode'}) if traffic_capable else frozenset()) |
                                                                         frozenset({'forcing_stop', 'plan_forcing_stop'}))
@@ -544,7 +549,9 @@ def starpilot_main():
                                           lead_approach_key=lead_approach_key, force_stop_provider=force_stop_provider,
                                           drive_id=current_start_ns, event=curve_event,
                                           faster_lead_takeoff=faster_lead_takeoff, wheel_coast=(wheel_coast, params),
-                                          experimental_speed_nudge=nudge_preferences.sample(now_ns))
+                                          experimental_speed_nudge=nudge_preferences.sample(now_ns),
+                                          smooth_stops=(smooth_stops_preferences.sample(now_ns)
+                                                        if smooth_stops_preferences is not None else False))
         if curve_preferences is not None and curve_host is not None and curve_result is not None:
           curve_preferences.persist(curve_host, curve_result, now_ns)
           assert curve_status is not None

@@ -190,3 +190,25 @@ decrease handles residual output rather than abruptly clipping acceleration.
 Tests cover continuous reference traces, the host-to-decoded-SCC path for both
 supported layouts, and unchanged native behavior outside this configuration.
 Physical launch response and ECU ownership still require vehicle qualification.
+
+## Smooth Stops
+
+Default-off `SmoothStops` softens the last metres of a stop on supported Hyundai, Kia and Genesis CAN cars under StarPilot
+longitudinal control. Without it, the planner's stop bit rises at walking pace, about a second before the wheels stop, and
+`LongControl`'s stopping state then ramps the request toward `CP.stopAccel` regardless of the plan: braking rises into the stop
+and the body rocks forward and back as the wheels stop.
+
+`smooth_stops.py` shapes the planner's output after the candidates are arbitrated, before the HKG vision stop buffer. Below
+3.5 m/s, when the plan intends to stop and is braking, a landing keeps the requested deceleration inside a corridor that falls
+with speed to a 0.15 m/s² kiss at walking pace. The corridor's edges are requested one actuator delay ahead of the car. The bound
+only removes braking: it never makes the stop the plan asks for more than 0.4 m longer, and whatever stops the car short of a
+lead (with a 3 m standing gap) always passes. A floor and an anti-stall press keep the car slowing against creep torque. While the
+kiss lands a rolling car the stop bit is held back; it rises once the wheels have nearly stopped (0.10 m/s or the car's
+standstill flag), when a lead is nearer than the kiss can stop short of, or after 2 s below walking pace. Once it has risen, the
+stopping ramp and the car's hold happen at rest, the plan passes unchanged and StarPilot's own stop bit owns the hold and the
+launch. A landing that ends while rolling hands back what it held at the planner's cruise jerk.
+
+Enhanced Stops commitments, `forceDecel`, FCW, driver override and SafeMode bypass the landing and keep their own stop.
+`smooth_stops_preferences.supported()` excludes CAN FD cars, the G90, blended and pedal longitudinal, cars without openpilot
+longitudinal, and any car with a vehicle-owned `LongitudinalExtension`, because those bring the car to rest their own way. The
+corridor was measured on a Hyundai Palisade; other supported HKG cars share its SCC stop request but not its brake tuning.
