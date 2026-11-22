@@ -193,22 +193,32 @@ Physical launch response and ECU ownership still require vehicle qualification.
 
 ## Smooth Stops
 
-Default-off `SmoothStops` softens the last metres of a stop on supported Hyundai, Kia and Genesis CAN cars under StarPilot
-longitudinal control. Without it, the planner's stop bit rises at walking pace, about a second before the wheels stop, and
-`LongControl`'s stopping state then ramps the request toward `CP.stopAccel` regardless of the plan: braking rises into the stop
-and the body rocks forward and back as the wheels stop.
+Default-off `SmoothStops` softens the last metres of a stop behind another car on gas Hyundai, Kia and Genesis CAN cars with the
+standard SCC encoding under StarPilot longitudinal control. Without it, the planner's stop bit rises at walking pace, about a
+second before the wheels stop, and `LongControl`'s stopping state then ramps the request toward `CP.stopAccel` regardless of the
+plan: braking rises into the stop and the body rocks forward and back as the wheels stop.
 
-`smooth_stops.py` shapes the planner's output after the candidates are arbitrated, before the HKG vision stop buffer. Below
-3.5 m/s, when the plan intends to stop and is braking, a landing keeps the requested deceleration inside a corridor that falls
-with speed to a 0.15 m/s² kiss at walking pace. The corridor's edges are requested one actuator delay ahead of the car. The bound
-only removes braking: it never makes the stop the plan asks for more than 0.4 m longer, and whatever stops the car short of a
-lead (with a 3 m standing gap) always passes. A floor and an anti-stall press keep the car slowing against creep torque. While the
-kiss lands a rolling car the stop bit is held back; it rises once the wheels have nearly stopped (0.10 m/s or the car's
-standstill flag), when a lead is nearer than the kiss can stop short of, or after 2 s below walking pace. Once it has risen, the
-stopping ramp and the car's hold happen at rest, the plan passes unchanged and StarPilot's own stop bit owns the hold and the
-launch. A landing that ends while rolling hands back what it held at the planner's cruise jerk.
+`smooth_stops.py` runs after the candidates are arbitrated and before the HKG vision stop buffer. When the MPC plans to come to
+rest behind radarState's leadOne below 3.5 m/s and the plan is braking, a landing keeps the requested deceleration inside a
+corridor that falls with speed to a 0.15 m/s² kiss at walking pace, its edges requested one actuator delay ahead of the car. The
+bound only removes braking; whatever stops the car short of the lead (3 m standing gap) passes. A floor and an anti-stall press
+keep the car slowing against creep torque. Once StarPilot's own stop bit rises, the landing holds it back for at most 0.5 m of
+travel and 1.5 s, so the stopping ramp and the hold start at or near rest. At rest the plan passes and the bit stays up until the
+plan asks to move. The MPC is seeded with its own unsoftened plan through a landing.
 
-Enhanced Stops commitments, `forceDecel`, FCW, driver override and SafeMode bypass the landing and keep their own stop.
-`smooth_stops_preferences.supported()` excludes CAN FD cars, the G90, blended and pedal longitudinal, cars without openpilot
-longitudinal, and any car with a vehicle-owned `LongitudinalExtension`, because those bring the car to rest their own way. The
-corridor was measured on a Hyundai Palisade; other supported HKG cars share its SCC stop request but not its brake tuning.
+A landing hands the stop back to StarPilot, unchanged and for the rest of that stop, when the plan asks to move or no longer
+stops behind the lead, when anything other than the MPC's lead stop (the model, cruise) asks clearly harder than the corridor, when
+the lead is closer than the kiss can stop short of, when the anti-stall press saturates, or when the hold-back budget is spent. A
+hand-back that lets the plan's braking through steps the request in one frame toward more braking. Model-only stops, Enhanced
+Stops commitments, `forceDecel`, FCW, driver override and SafeMode are never landed; Enhanced Stops' uncommitted approach to a
+light is, if the stop itself is behind a lead.
+
+Costs, from the closed-loop tests and from re-driving twelve logged lead stops on sixteen fitted variants of a Palisade's brake
+(simulated, not driven): stops behind a lead end a median 0.3 m closer to it and take a median 0.9 s longer, at worst 0.9 m and
+2.3 s on the weakest fitted brakes (0.3 m and 0.9 s on the test grid), and never closer than the 3 m standing gap allows. Braking
+at the wheel stop falls from a median 0.79 to 0.63 m/s². When the lead pulls away while the landed car is still rolling at a
+crawl, StarPilot launches it at the MPC's jerk limit rather than from standstill, up to 0.45 s later to 2 m/s. A larger hold-back
+budget lands softer and costs more: 1 m and 2.5 s gives 0.44 m/s² at 0.5 m median and 1.25 m worst extra roll.
+`smooth_stops_preferences.supported()` excludes CAN FD, hybrids, plug-ins, EVs and fuel-cell cars (regenerative braking hands over
+to the friction brake at kiss speeds), the Kona EV's legacy FCA11 path, the G90, blended and pedal longitudinal, cars without
+openpilot longitudinal, and any car with a vehicle-owned `LongitudinalExtension`. Only a 2023 Palisade has been measured.

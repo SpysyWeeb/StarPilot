@@ -7,6 +7,7 @@ from openpilot.starpilot.ui.long_profile_feature import CATEGORY_HELP, VALUE_HEL
 from openpilot.starpilot.ui.feature_settings_state import SLC_OFFSET_KEYS
 
 from openpilot.starpilot.longitudinal.enhanced_stop_hold import KEY as HOLD_KEY, DESCRIPTION as HOLD_DESCRIPTION
+from openpilot.starpilot.longitudinal.smooth_stops_preferences import KEY as SMOOTH_STOPS_KEY, DESCRIPTION as SMOOTH_STOPS_DESCRIPTION
 
 DESCRIPTIONS = {
   HOLD_KEY: HOLD_DESCRIPTION,
@@ -66,8 +67,7 @@ DESCRIPTIONS = {
   'ReverseCruise': 'Swaps the Toyota short-press and held-press cruise-speed increments.',
   'ForceStops': 'Improves stopping behavior at traffic lights and enables automatic stopping at detected stop signs. Press the accelerator to continue.',
   'ForceStopDistanceOffset': 'Moves the planned stopping point. Positive values stop farther forward; negative values stop earlier.',
-  'SmoothStops': ('Eases off the brakes in the last few feet of a stop so the car settles to a halt instead of lurching. ' +
-                  'Stops take a moment longer and end slightly farther forward. Supported Hyundai, Kia and Genesis vehicles.'),
+  SMOOTH_STOPS_KEY: SMOOTH_STOPS_DESCRIPTION,
   'LeadApproachBuffer': 'Gradually adds following distance when approaching a slower or braking lead vehicle.',
   'LowSpeedCruiseOnSet': ('Uses the vehicle’s minimum engagement speed as the floor when pressing SET with StarPilot cruise. ' +
                          'SET uses your current speed when you are above that floor.'),

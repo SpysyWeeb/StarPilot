@@ -26,7 +26,8 @@ from openpilot.starpilot.longitudinal.accel_profile import A_CRUISE_MAX_VALS_TRA
 from openpilot.starpilot.longitudinal.profile_runtime import TRAFFIC_CRUISE_BRAKE_MAGNITUDE
 from openpilot.starpilot.longitudinal.lead_approach_runtime import KEY as LEAD_APPROACH_KEY
 from openpilot.starpilot.longitudinal.lead_takeoff_preferences import KEY as LEAD_TAKEOFF_KEY
-from openpilot.starpilot.longitudinal.smooth_stops_preferences import KEY as SMOOTH_STOPS_KEY, supported as smooth_stops_supported
+from openpilot.starpilot.longitudinal.smooth_stops_preferences import (KEY as SMOOTH_STOPS_KEY, DESCRIPTION as SMOOTH_STOPS_DESCRIPTION,
+                                                                     supported as smooth_stops_supported)
 from openpilot.starpilot.longitudinal.encouragement import KEY as NUDGE_KEY
 from openpilot.selfdrive.car.cruise import LOW_SPEED_CRUISE_ON_SET
 from openpilot.starpilot.longitudinal.planner_selection import KEY as PLANNER_SELECTION_KEY, save_selection
@@ -90,8 +91,6 @@ AGGRESSIVE_COOLING_DESCRIPTION = ("Runs the fan sooner and harder to keep the co
                                   "at the cost of more fan noise. Applies next drive.")
 GLOBAL_BOOL_PREFERENCES = frozenset((LEAD_APPROACH_KEY, LEAD_TAKEOFF_KEY, NUDGE_KEY, LOW_SPEED_CRUISE_ON_SET, SMOOTH_STOPS_KEY,
                                      "DisengageOnAccelerator", AGGRESSIVE_COOLING_KEY))
-SMOOTH_STOPS_DESCRIPTION = ("Eases off the brakes in the last few feet of a stop so the car settles to a halt instead of lurching. " +
-                            "Stops take a moment longer and end slightly farther forward. Supported Hyundai, Kia and Genesis vehicles.")
 
 
 def cooling_available() -> bool:
