@@ -157,7 +157,7 @@ class LongitudinalPlanner:
     self.vision_stop_buffer = vision_stop_owner(CP)
     self.ford_stop_approach = ford_stop_owner(CP, STOP_DISTANCE - .5) or vw_stop_owner(CP, STOP_DISTANCE - .5)
     self.preap_adaptive = preap_adaptive_owner(CP)
-    self.smooth_stops = smooth_stops_owner(CP, dt, (A_CRUISE_MAX_BP, J_CRUISE_VALS))
+    self.smooth_stops = smooth_stops_owner(CP, dt)
 
   def update(self, sm, *, cruise_ceiling: CruiseCeiling | None = None,
              profile_tuning: ProfileTuning | None = None, curve_ceiling: CurveCeiling | None = None,
@@ -238,7 +238,11 @@ class LongitudinalPlanner:
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
 
     if self.CP.openpilotLongitudinalControl:
-      self.mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
+      a_seed = self.output_a_target
+      if self.smooth_stops is not None and not reset_state:
+        # through a Smooth Stops landing the MPC continues its own plan, not the softened target the car was sent
+        a_seed = self.smooth_stops.plan_seed(a_seed)
+      self.mpc.set_cur_state(self.v_desired_filter.x, a_seed)
     else:
       self.mpc.set_cur_state(v_ego, sm['carState'].aEgo)
     base_follow = self.last_profile.follow_seconds if self.last_profile is not None else get_T_FOLLOW(sm['selfdriveState'].personality)
@@ -509,9 +513,11 @@ class LongitudinalPlanner:
         blocked=bool(self.output_should_stop or self.fcw or self.force_stop_plan.forcing or
                      self.force_stop_plan.approach_distance_m > 0 or self.mpc.solution_status != 0))
     if self.smooth_stops is not None:
-      # Enhanced Stops, forceDecel and FCW keep their own stop; the vision stop buffer below can still add braking and the stop bit
+      # Smooth Stops lands a stop behind a lead the MPC plans. Enhanced Stops commitments, forceDecel and FCW keep their own stop,
+      # and the vision stop buffer below can still add braking and the stop bit
       output_a_target, self.output_should_stop = self.smooth_stops.sample(
-        sm, target=output_a_target, stopping=self.output_should_stop, enabled=smooth_stops, plan_speeds=self.mpc.v_solution,
+        sm, target=output_a_target, stopping=self.output_should_stop, enabled=smooth_stops, plan_source=mpc_source,
+        plan_speeds=self.mpc.v_solution, target_source=self.mpc.source,
         active=profile_eligible and not reset_state and not self.fcw and not sm['controlsState'].forceDecel and
                not self.force_stop_plan.forcing)
     if self.vision_stop_buffer is not None:

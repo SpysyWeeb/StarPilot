@@ -2,29 +2,37 @@
 from openpilot.starpilot.saved_source import read_saved
 
 KEY = 'SmoothStops'
+DESCRIPTION = ("Eases off the brakes in the last few feet of a stop behind another car, so your car settles to a halt instead of " +
+               "lurching. Stops usually take about a second longer and end about a foot closer to the car ahead (up to 2.5 " +
+               "seconds and 3 feet), and if that car pulls away just as yours stops, yours can take half a second longer to " +
+               "follow. Gas Hyundai, Kia and Genesis vehicles with the classic SCC radar.")
 
 
 def supported(cp) -> bool:
-  """Hyundai, Kia and Genesis CAN cars whose stop runs through LongControl's own stopping state and the SCC stop request.
+  """Gas Hyundai, Kia and Genesis CAN cars whose stop runs through LongControl's own stopping state and the standard SCC stop
+  request: the kind of car the corridor was measured on.
 
-  CAN FD cars, the G90's hold shaping, blended and pedal longitudinal, and any car with a vehicle-owned LongControl policy
-  (stopping rate, stopping or start policy) bring the car to rest their own way and are left alone, as are cars without
-  openpilot longitudinal support.
+  CAN FD cars, hybrids, plug-ins, EVs and fuel cells (regenerative braking hands over to the friction brake at kiss speeds), the
+  Kona EV's legacy FCA11 encoding, the G90's hold shaping, blended and pedal longitudinal, cars without openpilot longitudinal,
+  and any car with a vehicle-owned LongControl policy (stopping rate, stopping or start policy) are left alone.
   """
   try:
     from opendbc.car.hyundai.values import CAR, HyundaiFlags, is_blended
-    excluded = HyundaiFlags.CANFD | HyundaiFlags.NON_SCC | HyundaiFlags.LEGACY | HyundaiFlags.UNSUPPORTED_LONGITUDINAL
+    excluded = (HyundaiFlags.CANFD | HyundaiFlags.NON_SCC | HyundaiFlags.LEGACY | HyundaiFlags.UNSUPPORTED_LONGITUDINAL |
+                HyundaiFlags.HYBRID | HyundaiFlags.EV | HyundaiFlags.FCEV)
     if (cp.brand != 'hyundai' or cp.carFingerprint not in CAR.__members__ or cp.passive or cp.dashcamOnly or cp.notCar or
         cp.flags & excluded or cp.carFingerprint == CAR.GENESIS_G90 or is_blended(cp)):
       return False
+    from opendbc.car.hyundai.hyundaican import uses_legacy_fca11
     from opendbc.car.hyundai.ray_pedal import ray_pedal_enabled
     from openpilot.starpilot.longitudinal.extension import create_extension
-    return not ray_pedal_enabled(cp) and create_extension(cp) is None
+    return not uses_legacy_fca11(cp) and not ray_pedal_enabled(cp) and create_extension(cp) is None
   except (AttributeError, IndexError, TypeError, ValueError):
     return False
 
 
 class SmoothStopsPreferences:
+  # the same bounded, once-a-second read as the other saved longitudinal preferences (Faster Takeoffs, Speed Nudge)
   def __init__(self, params):
     self.params = params
     self.enabled = False
