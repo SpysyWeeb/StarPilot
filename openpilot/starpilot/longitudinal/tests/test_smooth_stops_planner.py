@@ -11,8 +11,7 @@ from openpilot.cereal import messaging
 from openpilot.common.realtime import DT_CTRL, DT_MDL
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
-from openpilot.starpilot.longitudinal.force_stop import StopPlan
-from openpilot.starpilot.longitudinal.smooth_stops import HOLD_DISTANCE, HOLD_TIME, LEAD_STANDING_GAP, STANDSTILL_SPEED
+from openpilot.starpilot.longitudinal.smooth_stops import LEEWAY, STANDSTILL_SPEED
 from openpilot.starpilot.longitudinal.tests.test_cruise_ceiling import messages
 
 BASE_NS = 10_000_000_000
@@ -20,6 +19,9 @@ DRIVE_NS = BASE_NS - 1_000_000_000
 SERVICES = ('radarState', 'controlsState', 'selfdriveState', 'carState', 'vehicleParameters', 'carControl', 'modelV2')
 # the plants the review asked for: a brake as asked, one 0.1 short with creep torque, one 0.2 short with more creep
 PLANTS = ((0.0, 0.0), (0.1, 0.25), (0.2, 0.3))
+# the worst extra time to rest a landing costs on these drives, measured 1.4 s on the stopped-lead grid and 1.65 s for the model's
+# stops; an unbounded crawl takes several seconds more
+EXTRA_TIME = 2.0
 
 
 def palisade():
@@ -160,16 +162,24 @@ def rolling_launch(v_trigger, smooth, *, distance=14.0, v0=2.0, lead_accel=2.5, 
   return drive, t_go - (t_trigger if t_trigger is not None else 0.0)
 
 
+def at_stop(drive):
+  # braking still on as the wheels stop
+  t_rest = drive.rest[0]
+  return -sum(r[3] for r in drive.trace if t_rest - 0.3 <= r[0] <= t_rest - 0.1) / 5.0
+
+
 @pytest.mark.parametrize('v0,distance', [(2.0, 4.0), (3.0, 6.0), (2.0, 8.0), (3.4, 10.0)])
 @pytest.mark.parametrize('shortfall,creep', PLANTS)
 @pytest.mark.parametrize('early_bit', [False, True])
-def test_a_stop_for_something_only_the_model_sees_is_left_alone(v0, distance, shortfall, creep, early_bit):
-  # no lead to land behind: the review's weak and creeping brakes rolled past the object when these were landed
+def test_a_stop_for_something_only_the_model_sees_rests_within_the_leeway(v0, distance, shortfall, creep, early_bit):
+  # the review's weak and creeping brakes rolled past the object when an earlier landing was not bounded
   off = untracked_object(v0, distance, False, shortfall, creep, early_bit)
   on = untracked_object(v0, distance, True, shortfall, creep, early_bit)
-  assert on.rest[1] <= off.rest[1] + 0.15
+  assert math.isfinite(on.rest[0]), 'the car must come to rest'
+  assert on.rest[1] <= off.rest[1] + LEEWAY + 0.05
   assert on.rest[1] < distance or off.rest[1] >= distance
-  assert on.trace == off.trace
+  assert on.rest[0] - off.rest[0] <= EXTRA_TIME
+  assert on.stop_bit_pulses == 0
 
 
 @pytest.mark.parametrize('v0,distance', [(1.0, 8.0), (2.0, 9.0), (3.0, 10.0), (3.4, 9.5), (3.4, 12.0), (2.0, 12.0), (2.5, 14.0)])
@@ -179,11 +189,16 @@ def test_a_stopped_lead_stop_is_bounded_on_weak_and_creeping_brakes(v0, distance
   off, off_least, off_rest = stopped_lead(v0, distance, False, shortfall=shortfall, creep=creep, experimental=experimental)
   on, on_least, on_rest = stopped_lead(v0, distance, True, shortfall=shortfall, creep=creep, experimental=experimental)
   assert math.isfinite(on.rest[0]), 'the car must come to rest'
-  assert off_rest - on_rest <= HOLD_DISTANCE + 0.05, 'extra roll'
-  assert on.rest[0] - off.rest[0] <= HOLD_TIME + 0.05, 'extra time'
-  assert on_least >= min(off_least - 0.5, LEAD_STANDING_GAP)
+  assert off_rest - on_rest <= LEEWAY + 0.05, 'extra roll'
+  assert on.rest[0] - off.rest[0] <= EXTRA_TIME, 'extra time'
+  assert on_least >= min(off_least - 0.5, 3.0)
   assert on.stop_bit_pulses == 0
 
+
+def test_a_normal_stop_behind_a_lead_ends_under_the_kiss():
+  off, _, _ = stopped_lead(2.0, 12.0, False)
+  on, _, _ = stopped_lead(2.0, 12.0, True)
+  assert at_stop(off) > 0.6 and at_stop(on) < 0.3, (at_stop(off), at_stop(on))
 
 @pytest.mark.parametrize('distance', [14.0, 18.0])
 @pytest.mark.parametrize('v_trigger', [1.0, 0.7, 0.5, 0.38, 0.3])
@@ -198,18 +213,15 @@ def test_a_lead_pulling_away_in_the_last_metre_is_followed(distance, v_trigger):
   assert on_go <= off_go + 0.45 + 1e-9, (off_go, on_go)
 
 
-@pytest.mark.parametrize('scene', ['force_decel', 'enhanced_stop', 'fcw'])
+@pytest.mark.parametrize('scene', ['force_decel', 'fcw'])
 def test_urgent_owners_keep_their_own_stop(scene):
-  # forceDecel, an Enhanced Stops commitment and FCW bypass Smooth Stops: the drive is the same frame for frame
+  # forceDecel and FCW bypass Smooth Stops: the drive is the same frame for frame
   runs = []
   for smooth in (False, True):
     drive = Drive(3.0 if scene != 'fcw' else 4.0, smooth=smooth)
     for _ in range(round(8.0 / DT_MDL)):
       if scene == 'force_decel':
         drive.step(lead=Lead(20.0), force_decel=True)
-      elif scene == 'enhanced_stop':
-        plan = StopPlan(BASE_NS + drive.frame * 50_000_000, 0.0, None, True, True, max(8.0 - drive.x, 0.0))
-        drive.step(force_stop=plan)
       else:
         drive.step(lead=Lead(3.0))
     runs.append(drive.trace)
@@ -217,22 +229,20 @@ def test_urgent_owners_keep_their_own_stop(scene):
 
 
 def test_the_vision_stop_buffer_still_stops_for_a_close_vision_lead():
-  # a vision-only lead inside the buffer: its braking and stop bit are published with Smooth Stops on as without it
+  # a vision-only lead inside the buffer: the buffer still engages and the stop stays within the leeway of StarPilot's own
   runs = []
   for smooth in (False, True):
-    drive, least, _ = stopped_lead(2.0, 6.0, smooth, radar=False, seconds=10.0)
-    assert drive.planner.vision_stop_buffer.hold_until_ns > 0
-    runs.append(drive.trace)
-  assert runs[0] == runs[1]
+    drive, least, rest = stopped_lead(2.0, 6.0, smooth, radar=False, seconds=10.0)
+    assert drive.planner.vision_stop_buffer.hold_until_ns > 0 and drive.stop_bit_pulses == 0
+    runs.append(rest)
+  assert runs[0] - runs[1] <= LEEWAY + 0.05
 
 
-def test_the_stop_bit_rises_at_the_wheel_stop_or_once_the_hold_back_budget_is_spent():
+def test_the_stop_bit_rises_at_the_wheel_stop():
   drive, _, _ = stopped_lead(2.0, 12.0, True)
   t_rest, _ = drive.rest
   rises = [row for row in drive.trace if row[5]]
-  owner = drive.planner.smooth_stops
-  assert rises and (rises[0][2] <= STANDSTILL_SPEED + 0.01 or owner.exit_reason == 'hold')
-  assert owner.held_distance <= HOLD_DISTANCE + 0.05 and owner.held_time <= HOLD_TIME + DT_MDL
+  assert rises and rises[0][2] <= STANDSTILL_SPEED + 0.01
   holds = [row[0] for row in drive.trace if row[6] == LongCtrlState.stopping]
   assert holds and holds[0] <= t_rest + 0.25
   # and nothing rolls again while the lead stays
@@ -240,10 +250,10 @@ def test_the_stop_bit_rises_at_the_wheel_stop_or_once_the_hold_back_budget_is_sp
 
 
 @pytest.mark.parametrize('shortfall,creep', [(0.1, 0.25), (0.2, 0.3), (0.3, 0.6)])
-def test_a_weak_brake_against_creep_still_comes_to_rest_within_the_hold_budget(shortfall, creep):
-  off, _, _ = stopped_lead(1.5, 8.0, False, shortfall=shortfall, creep=creep)
-  on, _, _ = stopped_lead(1.5, 8.0, True, shortfall=shortfall, creep=creep)
-  assert math.isfinite(on.rest[0]) and on.rest[0] - off.rest[0] <= HOLD_TIME + 0.05
+def test_a_weak_brake_against_creep_still_comes_to_rest(shortfall, creep):
+  off, _, off_rest = stopped_lead(1.5, 8.0, False, shortfall=shortfall, creep=creep)
+  on, _, on_rest = stopped_lead(1.5, 8.0, True, shortfall=shortfall, creep=creep)
+  assert math.isfinite(on.rest[0]) and on.rest[0] - off.rest[0] <= EXTRA_TIME and off_rest - on_rest <= LEEWAY + 0.05
 
 
 def test_a_launch_from_rest_is_not_delayed():

@@ -9,11 +9,10 @@ from opendbc.car.hyundai.values import CAR
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
-from openpilot.starpilot.longitudinal.smooth_stops import (CREEP_FADE_SPEED, CREEP_SPEED, HOLD_DISTANCE, HOLD_TIME, KISS_DECEL,
-                                                           KISS_SPEED, LANDING_SPEED, LEAD_ABSENCE_TIME, LEAD_MIN_GAP_BUDGET,
-                                                           LEAD_STANDING_GAP, RESUME_SPEED, STALL_MAX, STANDSTILL_SPEED,
-                                                           URGENT_MARGIN, URGENT_TIME, Lead, SmoothStops, landing_bound,
-                                                           landing_floor, owner_for)
+from openpilot.starpilot.longitudinal.smooth_stops import (CREEP_FADE_SPEED, CREEP_SPEED, KISS_DECEL, KISS_SPEED, LANDING_SPEED,
+                                                           LEAD_ABSENCE_TIME, LEAD_STANDING_GAP, LEEWAY, STALL_MAX,
+                                                           STANDSTILL_SPEED, URGENT_DECEL, URGENT_TIME, Lead, SmoothStops,
+                                                           corridor_distance, landing_bound, landing_floor, owner_for)
 from openpilot.starpilot.longitudinal.smooth_stops_preferences import KEY, SmoothStopsPreferences, supported
 
 NOW = 100_000_000_000
@@ -31,13 +30,14 @@ def frames(seconds):
   return round(seconds / DT_MDL)
 
 
-def step(law, a_target, v_ego, leads=NO_LEADS, lead_stop=True, stopping=False, a_ego=None, standstill=False, other_target=False):
-  return law.update(a_target, v_ego, leads, lead_stop, stopping, a_ego=a_ego, standstill=standstill, other_target=other_target)
+def step(law, a_target, v_ego, leads=NO_LEADS, intent=True, stopping=False, a_ego=None, standstill=False, model=False,
+         committed=False):
+  return law.update(a_target, v_ego, leads, intent, stopping, a_ego=a_ego, standstill=standstill, model=model, committed=committed)
 
 
-def out(law, a_target, v_ego, leads=NO_LEADS, lead_stop=True, a_ego=None):
-  # StarPilot's own stop bit down: the hold-back budget is not spent
-  return step(law, a_target, v_ego, leads, lead_stop, a_ego=a_ego)[0]
+def out(law, a_target, v_ego, leads=NO_LEADS, intent=True, a_ego=None):
+  # StarPilot's own stop bit down and no model stop point: only the corridor and the leads act
+  return step(law, a_target, v_ego, leads, intent, a_ego=a_ego)[0]
 
 
 def landing(v_ego=1.5, a_target=-1.0, action_t=ACTION_T):
@@ -111,10 +111,14 @@ class TestCorridor:
       assert step(law, a_target, 0.0, stopping=True) == (a_target, True)
     assert law.landing
 
-  def test_a_landing_starts_only_below_landing_speed_on_a_braking_plan_that_stops_behind_a_lead(self):
+  def test_a_landing_starts_only_below_landing_speed_on_a_braking_plan_that_means_to_stop(self):
     law = SmoothStops(DT_MDL, ACTION_T)
     assert out(law, -2.0, LANDING_SPEED + 0.1) == -2.0 and not law.landing
-    assert out(law, -2.0, 1.5, lead_stop=False) == -2.0 and not law.landing
+    assert out(law, -2.0, 1.5, intent=False) == -2.0 and not law.landing
+    # StarPilot's own stop bit, once published, is never withdrawn by a landing starting late
+    assert step(law, -0.1, 1.0, stopping=True) == (-0.1, True) and not law.landing
+    assert step(law, -1.0, 0.9, stopping=True) == (-1.0, True) and not law.landing
+    law = SmoothStops(DT_MDL, ACTION_T)
     assert out(law, 0.5, 1.0) == 0.5 and not law.landing
     assert out(law, -KISS_DECEL / 2.0, 0.2) == -KISS_DECEL / 2.0 and not law.landing
     assert out(law, -1.0, 1.5) < -0.9 and law.landing
@@ -137,27 +141,22 @@ class TestHandBack:
       assert not law.landing and law.exit_reason == 'launch'
       assert step(law, 0.8, v_ego, stopping=True) == (0.8, True)
 
-  def test_a_plan_that_no_longer_stops_behind_a_lead_hands_back(self):
+  def test_a_plan_that_no_longer_means_to_stop_hands_back(self):
     law = landing(1.0, -0.6)
-    assert step(law, -0.4, 0.9, lead_stop=False, stopping=True) == (-0.4, True)
+    assert step(law, -0.4, 0.9, intent=False) == (-0.4, False)
     assert law.exit_reason == 'go'
 
-  def test_a_demand_from_something_other_than_the_lead_clearly_harder_than_the_corridor_hands_back(self):
+  def test_a_sudden_hard_demand_hands_back(self):
     law = landing(1.0, -0.6)
-    urgent = -(law.bound(0.9) + URGENT_MARGIN + 0.05)
+    urgent = -(URGENT_DECEL + 0.1)
     for _ in range(max(round(URGENT_TIME / DT_MDL), 1) - 1):
-      assert step(law, urgent, 0.9, other_target=True)[0] == -law.bound(0.9) and law.landing
-    assert step(law, urgent, 0.9, other_target=True)[0] == urgent and law.exit_reason == 'urgent'
-    # a single hard frame between ordinary ones does not, nor does the MPC's own ramp behind the lead
+      assert step(law, urgent, 0.9)[0] == -law.bound(0.9) and law.landing
+    assert step(law, urgent, 0.9)[0] == urgent and law.exit_reason == 'urgent'
+    # a single hard frame between ordinary ones does not
     law = landing(1.0, -0.6)
     for a_target in (urgent, -0.5, urgent, -0.5):
-      step(law, a_target, 0.9, other_target=True)
+      step(law, a_target, 0.9)
     assert law.landing or URGENT_TIME <= DT_MDL
-    law = landing(1.0, -0.6)
-    for _ in range(frames(0.5)):
-      assert out(law, urgent, 0.9) == -law.bound(0.9)
-    assert law.landing
-
   def test_a_lead_the_kiss_cannot_stop_short_of_hands_back(self):
     law = landing(0.8, -0.6)
     assert out(law, -0.6, 0.8, leads(6.0)) > -0.6 and law.landing
@@ -175,20 +174,38 @@ class TestHandBack:
       assert law.required_decel == kept
     out(law, -0.6, 1.0)
     assert law.required_decel == 0.0 and law.landing
+
   @pytest.mark.parametrize('speeds', [(0.45,), (0.36, 0.42), (1.0,)])
-  def test_the_stop_bit_is_held_back_for_at_most_the_hold_budget(self, speeds):
-    # the review's cases: a car stuck at 0.45 m/s, or alternating either side of walking pace, with StarPilot's bit up
-    # (with the review's -0.6 plan the landing hands back at once as urgent below walking pace)
-    law = landing(1.0, -0.4)
+  @pytest.mark.parametrize('a_ego', [0.0, -0.2])
+  def test_a_car_that_keeps_rolling_past_starpilots_own_stop_point_hands_back(self, speeds, a_ego):
+    # the review's cases: a car stuck at 0.45 m/s, or alternating either side of walking pace, with StarPilot's bit up; without the
+    # stop point fixed to the road they would crawl on under the kiss for as long as the car does
+    law = landing(1.0, -0.6)
     for i in range(frames(20.0)):
       v_ego = speeds[(i // 10) % len(speeds)]
-      result, bit = step(law, -0.4, v_ego, stopping=True, a_ego=-0.2)
+      result, bit = step(law, -0.6, v_ego, stopping=True, a_ego=a_ego)
       if not law.landing:
         break
       assert bit is False
-    assert not law.landing and law.exit_reason in ('hold', 'stall') and bit is True
-    assert law.held_time <= HOLD_TIME + 1e-9 and law.held_distance <= HOLD_DISTANCE + 1.0 * DT_MDL + 1e-9
+    assert not law.landing and law.exit_reason in ('overrun', 'stall') and bit is True
+    assert law.travelled <= law.ramp_anchor + LEEWAY + 1e-9 and i * DT_MDL < 4.0
 
+  def test_a_model_stop_rests_within_the_leeway_of_its_point_on_a_weak_brake(self):
+    # a car that answers one actuator delay late, delivers 70 % of what it is asked and creeps: the model asks to stop 6 m ahead
+    for delivered, creep in ((1.0, 0.0), (0.7, 0.0), (0.7, 0.25)):
+      law = SmoothStops(DT_MDL, ACTION_T)
+      x, v, a = 0.0, 2.0, 0.0
+      pipe = [0.0] * frames(ACTION_T)
+      for _ in range(frames(30.0)):
+        plan = -min(v * v / (2.0 * max(6.0 - x, 0.05)), 4.0) if v > 0.0 else -0.3
+        request, _ = step(law, plan, v, stopping=v < 0.3, a_ego=a, model=True)
+        pipe.append(request)
+        request = pipe.pop(0)
+        a = delivered * request + (creep if v < 1.5 and request > -0.3 else 0.0)
+        if v <= 0.0 and a <= 0.0:
+          break
+        x, v = x + v * DT_MDL, max(v + a * DT_MDL, 0.0)
+      assert v == 0.0 and x <= 6.0 + LEEWAY + 0.05, (delivered, creep, x)
   def test_a_car_that_keeps_not_slowing_hands_back(self):
     law = landing(0.8, -0.3)
     for _ in range(frames(10.0)):
@@ -197,12 +214,12 @@ class TestHandBack:
         break
     assert law.exit_reason == 'stall' and law.integral >= STALL_MAX - 1e-9
 
-  def test_after_a_hand_back_the_car_is_starpilots_until_it_rolls_again(self):
+  def test_a_stop_handed_back_is_starpilots_until_the_plan_no_longer_means_to_stop(self):
     law = landing(1.0, -0.6)
     step(law, 0.3, 0.5)
     assert step(law, -0.6, 0.4) == (-0.6, False) and not law.landing
-    assert step(law, -0.6, RESUME_SPEED - 0.01) == (-0.6, False) and not law.landing
-    out(law, -0.6, RESUME_SPEED)
+    assert step(law, -0.6, 0.4, intent=False) == (-0.6, False) and not law.landing
+    out(law, -0.6, 0.4)
     assert law.landing
 
   def test_nonfinite_inputs(self):
@@ -210,6 +227,26 @@ class TestHandBack:
     assert step(law, -2.0, math.nan, stopping=True) == (-2.0, True) and not law.landing
     law = landing()
     assert math.isnan(out(law, math.nan, 1.0)) and law.landing
+
+
+class TestLeeway:
+  def test_the_corridor_alone_is_left_alone_while_its_rest_point_fits(self):
+    law = landing(1.5, -1.0)
+    assert law.overrun_requirement(1.5, corridor_distance(1.5) - LEEWAY + 1.5 * ACTION_T + 0.01) == 0.0
+    # past it, the speed is shed before the kiss, then at the corridor's bound, then the plain stop in the room left
+    need = law.overrun_requirement(1.5, corridor_distance(1.5) - LEEWAY + 1.5 * ACTION_T - 0.2)
+    assert 0.0 < need <= law.bound(1.5)
+    assert law.overrun_requirement(1.5, 0.3) >= 1.5 * 1.5 / (2.0 * (0.3 + LEEWAY - 1.5 * ACTION_T)) - 1e-9
+    assert law.overrun_requirement(1.5, -LEEWAY) == math.inf
+
+  def test_starpilots_own_stop_point_is_fixed_to_the_road(self):
+    law = landing(1.0, -0.6)
+    step(law, -0.6, 0.9, stopping=True, a_ego=-0.6)
+    anchor = law.ramp_anchor
+    assert 0.0 < anchor < 2.0
+    for _ in range(frames(1.0)):
+      step(law, -0.6, 0.5, stopping=True, a_ego=-0.6)
+    assert law.ramp_anchor == anchor and law.travelled > 0.5
 
 
 class TestStopBit:
@@ -239,7 +276,7 @@ class TestStopBit:
 
   def test_outside_a_landing_the_target_and_bit_are_starpilots(self):
     law = SmoothStops(DT_MDL, ACTION_T)
-    assert step(law, 0.3, 0.2, stopping=True) == (0.3, True)
+    assert step(law, 0.3, 0.2, stopping=True) == (0.3, True) and not law.landing
     assert step(law, -1.0, 5.0, stopping=False) == (-1.0, False)
 
 
@@ -254,13 +291,14 @@ class TestLead:
       outputs.append(result)
     assert max(abs(b - a) for a, b in zip(outputs, outputs[1:], strict=False)) < 0.01
 
-  def test_a_lead_gets_what_stops_the_car_short_of_it_after_the_delay(self):
+  def test_a_lead_gets_what_stops_the_car_the_standing_gap_short_of_it_after_the_delay(self):
+    # (the stop point from StarPilot's own stop is not involved: its bit is down)
     for v_ego, obstacle, plan in ((0.37, (0.32,), -0.6), (1.0, (1.0,), -2.0), (0.7, (0.6,), -1.5), (1.5, (1.1,), -3.5),
                                   (3.0, (1.0, 3.0, -4.0), -3.5), (0.5, (1.2,), -1.0), (0.5, (0.8,), -1.0), (2.0, (3.0,), -2.0)):
       law = landing(v_ego, -1.0)
       distance, speed, acceleration = (*obstacle, 0.0, 0.0)[:3]
       rest = distance + (speed * speed / (-2.0 * acceleration) if acceleration < 0.0 else 0.0)
-      room = rest - v_ego * ACTION_T - LEAD_MIN_GAP_BUDGET
+      room = rest - v_ego * ACTION_T - LEAD_STANDING_GAP
       needs = v_ego * v_ego / (2.0 * room) if room > 0.0 else math.inf
       result = out(law, plan, v_ego, leads(*obstacle), a_ego=-0.5)
       assert -result >= min(needs, -plan) - 1e-9, (v_ego, obstacle, result)
@@ -302,45 +340,53 @@ class TestPlannerHook:
     return {'carState': NS(vEgo=v_ego, aEgo=a_ego, standstill=standstill),
             'radarState': NS(leadOne=radar(lead is not None, lead or 0.0), leadTwo=radar(False))}
 
-  def sample(self, law, sm, target, *, enabled=True, active=True, source=SOURCE.lead0, end=0.0, stopping=True):
-    return law.sample(sm, target=target, stopping=stopping, enabled=enabled, active=active, plan_source=source,
-                      plan_speeds=[1.0, 0.5, end], target_source=source)
+  def sample(self, law, sm, target, *, enabled=True, active=True, source=SOURCE.lead0, end=0.0, stopping=False, forcing=False):
+    return law.sample(sm, target=target, stopping=stopping, enabled=enabled, active=active, plan_speeds=[1.0, 0.5, end],
+                      target_source=source, forcing=forcing)
 
   def test_disabled_inactive_or_idle_returns_the_planner_values_themselves(self):
     law = SmoothStops(DT_MDL, ACTION_T)
     target = np.float64(-1.0)
     for enabled, active in ((False, True), (True, False), (False, False)):
-      result = self.sample(law, self.sm(), target, enabled=enabled, active=active)
+      result = self.sample(law, self.sm(), target, enabled=enabled, active=active, stopping=True)
       assert result[0] is target and result[1] is True
     assert law.idle and law.plan_seed(target) is target
-    result = self.sample(law, self.sm(), target, source=SOURCE.cruise)
+    # a plan that does not mean to stop: nothing to land
+    result = self.sample(law, self.sm(), target, source=SOURCE.cruise, end=2.0)
     assert result[0] is target and not law.landing
 
-  def test_a_stop_behind_a_lead_is_landed_and_the_mpc_continues_the_unsoftened_plan(self):
+  @pytest.mark.parametrize('kwargs', [{}, {'lead': None}, {'source': SOURCE.cruise, 'lead': None}])
+  def test_every_stop_is_landed_and_the_mpc_continues_the_unsoftened_plan(self, kwargs):
     law = SmoothStops(DT_MDL, ACTION_T)
-    target, bit = self.sample(law, self.sm(v_ego=0.6), -0.9)
+    source = kwargs.pop('source', SOURCE.lead0)
+    target, bit = self.sample(law, self.sm(v_ego=0.6, **kwargs), -0.9, source=source)
     assert law.landing and bit is False and target > -0.9
     assert law.plan_seed(target) == -0.9
-    # no lead, a plan that does not stop, or a plan that is not the MPC's lead stop: nothing to land
-    for kwargs in ({'source': SOURCE.e2e}, {'end': 2.0}):
-      other = SmoothStops(DT_MDL, ACTION_T)
-      self.sample(other, self.sm(v_ego=0.6), -0.9, **kwargs)
-      assert not other.landing
-    other = SmoothStops(DT_MDL, ACTION_T)
-    self.sample(other, self.sm(v_ego=0.6, lead=None), -0.9)
-    assert not other.landing
 
+  def test_the_models_stop_and_an_enhanced_stops_commitment_are_landed(self):
+    law = SmoothStops(DT_MDL, ACTION_T)
+    # the model's request held stops the car within a few seconds, though the MPC's plan does not
+    self.sample(law, self.sm(v_ego=0.8, lead=None), -0.5, source=SOURCE.e2e, end=2.0)
+    assert law.landing and math.isfinite(law.model_anchor)
+    law = SmoothStops(DT_MDL, ACTION_T)
+    self.sample(law, self.sm(v_ego=0.8, lead=None), -0.05, source=SOURCE.e2e, end=2.0)
+    assert not law.landing
+    # Enhanced Stops hands its last metres to StarPilot's stop bit: the landing takes them from the frame it rises, never asks to
+    # accelerate while committed, and keeps the stop within the leeway of where StarPilot's own ramp would have ended it
+    law = SmoothStops(DT_MDL, ACTION_T)
+    target, bit = self.sample(law, self.sm(v_ego=1.2, lead=None), 0.3, source=SOURCE.cruise, end=2.0, stopping=True, forcing=True)
+    assert law.landing and bit is False and target <= 0.0 and law.ramp_anchor is not None
   def test_turning_it_off_mid_landing_hands_the_plan_back(self):
     law = SmoothStops(DT_MDL, ACTION_T)
     assert self.sample(law, self.sm(), -0.9)[1] is False and law.landing
-    assert self.sample(law, self.sm(), -0.9, active=False) == (-0.9, True)
+    assert self.sample(law, self.sm(), -0.9, active=False, stopping=True) == (-0.9, True)
     assert law.idle and law.plan_seed(-0.2) == -0.2
 
   def test_owner_only_for_supported_cars_with_starpilot_longitudinal(self):
     cp = CarInterface.get_non_essential_params(CAR.HYUNDAI_PALISADE)
     cp.openpilotLongitudinalControl, cp.pcmCruise = True, False
     law = owner_for(cp, DT_MDL)
-    assert law is not None and math.isclose(law.action_t, ACTION_T)
+    assert law is not None and math.isclose(law.action_t, ACTION_T) and law.stop_accel == cp.stopAccel
     assert math.isclose(law.urgent_frames * DT_MDL, max(URGENT_TIME, DT_MDL))
     cp.openpilotLongitudinalControl, cp.pcmCruise = False, True
     assert owner_for(cp, DT_MDL) is None

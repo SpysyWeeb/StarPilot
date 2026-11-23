@@ -513,13 +513,12 @@ class LongitudinalPlanner:
         blocked=bool(self.output_should_stop or self.fcw or self.force_stop_plan.forcing or
                      self.force_stop_plan.approach_distance_m > 0 or self.mpc.solution_status != 0))
     if self.smooth_stops is not None:
-      # Smooth Stops lands a stop behind a lead the MPC plans. Enhanced Stops commitments, forceDecel and FCW keep their own stop,
-      # and the vision stop buffer below can still add braking and the stop bit
+      # Smooth Stops lands every stop, Enhanced Stops' included; forceDecel and FCW keep their own stop, and the vision stop buffer
+      # below can still add braking and the stop bit
       output_a_target, self.output_should_stop = self.smooth_stops.sample(
-        sm, target=output_a_target, stopping=self.output_should_stop, enabled=smooth_stops, plan_source=mpc_source,
-        plan_speeds=self.mpc.v_solution, target_source=self.mpc.source,
-        active=profile_eligible and not reset_state and not self.fcw and not sm['controlsState'].forceDecel and
-               not self.force_stop_plan.forcing)
+        sm, target=output_a_target, stopping=self.output_should_stop, enabled=smooth_stops,
+        plan_speeds=self.mpc.v_solution, target_source=self.mpc.source, forcing=self.force_stop_plan.forcing,
+        active=profile_eligible and not reset_state and not self.fcw and not sm['controlsState'].forceDecel)
     if self.vision_stop_buffer is not None:
       output_a_target, self.output_should_stop = self.vision_stop_buffer.sample(
         sm, now_ns=sample_now_ns, drive_id=drive_id, target=float(output_a_target),
