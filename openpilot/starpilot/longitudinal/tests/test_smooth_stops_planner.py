@@ -269,6 +269,46 @@ def test_an_enhanced_stops_committed_stop_is_landed_short_of_its_line(v0, line, 
   assert release[1] <= release[0] + DT_MDL + 1e-9, release
 
 
+@pytest.mark.parametrize('shortfall,creep', [(0.0, 0.0), (0.2, 0.3)])
+@pytest.mark.parametrize('v0,line', [(3.0, 15.0), (5.0, 25.0)])
+def test_an_enhanced_stops_approach_never_rests_past_its_line(v0, line, shortfall, creep):
+  # Enhanced Stops tracking a light it has not committed to: the MPC stops for its obstacle, and the landing never takes the car past
+  # the tracked line (unless StarPilot's own stop passes it too)
+  rests = []
+  for smooth in (False, True):
+    drive = Drive(v0, smooth=smooth, shortfall=shortfall, creep=creep)
+    for _ in range(round(30.0 / DT_MDL)):
+      left = line - drive.x
+      plan = StopPlan(BASE_NS + drive.frame * 50_000_000 - 10_000_000, None, max(0.0, left * 0.93), False, False, 0.0,
+                      max(left, 0.0), 0.32, False, target_m=max(left, 0.0))
+      drive.step(force_stop=plan, v_cruise=max(v0, 3.0))
+    rests.append(drive.rest[1])
+    assert drive.stop_bit_pulses == 0
+  assert rests[1] <= max(line, rests[0]) + 0.05, rests
+
+
+def test_a_lead_pulling_away_does_not_take_the_car_through_the_models_stop():
+  # Experimental mode at a red light: the model says stop and asks about nothing (0 to +0.1) while the lead ahead pulls away below
+  # walking pace. StarPilot's stop bit comes from the model and must hold the car, with Smooth Stops as without it
+  runs = []
+  for smooth in (False, True):
+    drive = Drive(1.2, smooth=smooth)
+    lead = Lead(7.0)
+    departed = None
+    for i in range(round(16.0 / DT_MDL)):
+      if departed is None and drive.v < 0.3 and drive.frame > 5:
+        departed = i
+      if departed is not None:
+        lead.speed = min(lead.speed + 2.5 * DT_MDL, 5.0)
+        lead.x += lead.speed * DT_MDL
+      e2e = -0.6 if departed is None else 0.02 + 0.08 * ((i - departed) % 20) / 20.0
+      drive.step(lead=lead, experimental=True, model_stop=True, e2e=e2e)
+    after = [row for row in drive.trace if departed is not None and row[0] > departed * DT_MDL + 2.0]
+    runs.append((max(row[2] for row in after), all(row[5] for row in after), drive.stop_bit_pulses))
+  (off_v, off_bit, _), (on_v, on_bit, on_pulses) = runs
+  assert off_bit and on_bit and on_v <= off_v + 0.02 and on_pulses == 0, runs
+
+
 @pytest.mark.parametrize('event', ['force_decel', 'fcw'])
 def test_forcedecel_or_fcw_mid_landing_hands_the_stop_back_at_once(event):
   drive = Drive(2.0, smooth=True)

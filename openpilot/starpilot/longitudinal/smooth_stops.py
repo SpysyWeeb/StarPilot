@@ -150,8 +150,7 @@ class SmoothStops:
     self.action_t = action_t
     self.stop_accel = stop_accel
     self.stopping_decel_rate = stopping_decel_rate
-    self.bound_bp = request_breakpoints(BOUND_BP, BOUND_V, action_t)
-    self.floor_bp = request_breakpoints(FLOOR_BP, FLOOR_V, action_t)
+    self.set_action_t(action_t)
     self.absence_frames = max(round(LEAD_ABSENCE_TIME / dt), 1)
     self.urgent_frames = max(round(URGENT_TIME / dt), 1)
     self.anchor_frames = max(round(ANCHOR_TIME / dt), 1)
@@ -165,6 +164,7 @@ class SmoothStops:
     self.handed_back = False
     self.committed = False
     self.stop_target = None
+    self.going = self.stopping = False
     self.launching = False
     self.stop_bit = False
     self.bit_frames = 0
@@ -186,6 +186,12 @@ class SmoothStops:
   @property
   def idle(self):
     return not (self.landing or self.handed_back or any(self._lead_requirements))
+
+  def set_action_t(self, action_t):
+    # the planner's effective actuator delay (with any developer override) sets how far ahead the corridor's edges are requested
+    self.action_t = action_t
+    self.bound_bp = request_breakpoints(BOUND_BP, BOUND_V, action_t)
+    self.floor_bp = request_breakpoints(FLOOR_BP, FLOOR_V, action_t)
 
   def plan_seed(self, published):
     # the acceleration the MPC continues from: the plan the landing softened last frame, else what was published
@@ -239,16 +245,19 @@ class SmoothStops:
     shed = (v_ego * v_ego - KISS_SPEED * KISS_SPEED) / (2.0 * (room - KISS_DISTANCE)) if v_ego > KISS_SPEED and room > KISS_DISTANCE else 0.0
     return max(stop_within(v_ego, room), min(shed, self.bound(v_ego)))
 
-  def sample(self, sm, *, target, stopping, enabled, active, plan_speeds, target_source, forcing, stop_target=None):
+  def sample(self, sm, *, target, stopping, enabled, active, plan_speeds, target_source, forcing, stop_target=None, action_t=None):
     """The planner's hook: returns (target, stopping) untouched unless Smooth Stops is enabled, the planner allows it and a
     landing is under way. plan_speeds is the MPC's speed solution, target_source the candidate that set target, forcing says
-    Enhanced Stops is committed and stop_target is where its committed stop means to end."""
+    Enhanced Stops is committed, stop_target is where its committed or approaching stop means to end and action_t is the planner's
+    effective actuator delay."""
     if not (enabled and active):
       if not self.idle:
         self.reset()
       self._last_output, self._last_bit = target, bool(stopping)
       return target, stopping
     try:
+      if action_t is not None and math.isfinite(action_t) and action_t != self.action_t:
+        self.set_action_t(float(action_t))
       car, radar = sm['carState'], sm['radarState']
       leads = (Lead.from_radar(radar.leadOne), Lead.from_radar(radar.leadTwo))
       v_ego, a_target = float(car.vEgo), float(target)
@@ -258,10 +267,12 @@ class SmoothStops:
       model = target_source == E2E
       model_stop = model and a_target < 0.0 and v_ego < -a_target * MODEL_STOP_TIME
       intent = bool(stopping or forcing or model_stop or plan_end < (GO_SPEED if self.landing else STOP_INTENT_SPEED))
+      # in Experimental mode the model's own stop (a red light, say) keeps StarPilot's bit, whatever a departing lead does
+      model_holds = self._model_holds(sm)
       output, bit = self.update(a_target, v_ego, leads, intent, bool(stopping), a_ego=float(car.aEgo),
                                 standstill=bool(car.standstill), model=model, committed=bool(forcing),
-                                stop_target=float(stop_target) if forcing and stop_target is not None else None,
-                                going=plan_end >= GO_SPEED)
+                                stop_target=float(stop_target) if stop_target is not None else None,
+                                going=plan_end >= GO_SPEED and not model_holds)
     except (AttributeError, KeyError, TypeError, ValueError, OverflowError, IndexError):
       self.reset()
       self._last_output, self._last_bit = target, bool(stopping)
@@ -272,6 +283,13 @@ class SmoothStops:
       return target, bit
     self.plan_target = a_target if output != a_target else None
     return output, bit
+
+  @staticmethod
+  def _model_holds(sm):
+    try:
+      return bool(sm['selfdriveState'].experimentalMode and sm['modelV2'].action.shouldStop)
+    except (AttributeError, KeyError, TypeError):
+      return False
 
   def update(self, a_target, v_ego, leads, intent, stopping, a_ego=None, standstill=False, model=False, committed=False,
              stop_target=None, going=False):
@@ -288,6 +306,7 @@ class SmoothStops:
     v_ego = max(v_ego, 0.0)
     self.committed = committed
     self.stop_target = stop_target
+    self.going, self.stopping = going, stopping
     # keep each lead's last requirement through a short dropout of its reading
     for i, lead in enumerate(leads):
       if lead.present:
@@ -352,8 +371,9 @@ class SmoothStops:
 
     if rolling or not self.stop_bit:
       # the landing only eases what StarPilot itself asks; braking beyond it comes only from the press, while the car is not
-      # delivering it. An Enhanced Stops commitment stops the car whatever the plan asks, so its landing never asks to accelerate
-      plan = min(plan, 0.0) if self.committed else plan
+      # delivering it. Under an Enhanced Stops commitment or StarPilot's own stop bit, StarPilot stops the car whatever the plan
+      # asks, so the landing never asks to accelerate
+      plan = min(plan, 0.0) if self.committed or stopping else plan
       press = self.integral if rolling else 0.0
       bound = max(self.bound(v_ego), self.required_decel, self.overrun_decel)
       output = max(plan, -bound)
@@ -398,12 +418,16 @@ class SmoothStops:
     if self.committed and self.stop_target is not None:
       # an Enhanced Stops commitment knows its own stop point; the landing may use it all but never pass it
       return self.stop_target - LEEWAY
+    # approaching a light Enhanced Stops tracks, the landing never passes its line either
+    line = self.stop_target - LEEWAY if self.stop_target is not None else math.inf
     if model:
       # the model's request rises against a car that falls behind its stop point, so a model stop gets no leeway past that point
       self.model_anchor = min(self.model_anchor, self.travelled + v_ego * self.action_t + held_stop_distance(v_ego, a_target) - LEEWAY)
-    return min(self.ramp_anchor if self.ramp_anchor is not None else math.inf, self.model_anchor) - self.travelled
+    return min(min(self.ramp_anchor if self.ramp_anchor is not None else math.inf, self.model_anchor) - self.travelled, line)
   def _exit_reason(self, a_target, v_ego):
-    if a_target > 0.0 and not self.committed:
+    # a plan asking to move ends the landing when the plan is under way or StarPilot's own bit is down; a plan barely positive under
+    # StarPilot's bit (a lead creeping, the model's red light) is still StarPilot's stop, and the landing keeps easing it to rest
+    if a_target > 0.0 and not self.committed and (self.going or not self.stopping):
       return 'launch'
     if v_ego >= LANDING_SPEED and not self.committed:
       return 'window'

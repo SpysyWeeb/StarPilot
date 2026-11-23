@@ -310,10 +310,11 @@ class TestStopBit:
     assert bits == [False, False, False] and law.exit_reason == 'launch'
     # the plan no longer asking to move with StarPilot's bit still up: its bit is published, and stays
     assert step(law, -0.05, 0.25, stopping=True)[1] is True and step(law, 0.1, 0.25, stopping=True)[1] is True
-    # a plan barely positive, not going, with StarPilot's bit up is StarPilot's stop: the held bit is published at the hand-back
+    # a plan barely positive, not going, under StarPilot's bit is still StarPilot's stop: the landing eases it on to rest
     law = landing(0.4, -0.4)
     step(law, -0.4, 0.3, stopping=True)
-    assert step(law, 0.05, 0.25, stopping=True, going=False) == (0.05, True) and law.exit_reason == 'launch'
+    result, bit = step(law, 0.05, 0.25, stopping=True, going=False)
+    assert law.landing and result <= 0.0 and bit is False
 
   def test_a_published_bit_is_never_withdrawn_across_a_reset(self):
     # forceDecel, FCW, the toggle or longActive dropping for a frame resets the landing; StarPilot's bit published meanwhile stays
@@ -436,6 +437,33 @@ class TestPlannerHook:
     assert self.sample(law, self.sm(), -0.9)[1] is False and law.landing
     assert self.sample(law, self.sm(), -0.9, active=False, stopping=True) == (-0.9, True)
     assert law.idle and law.plan_seed(-0.2) == -0.2
+
+  @pytest.mark.parametrize('model_stop', [True, False])
+  def test_the_models_stop_keeps_starpilots_bit_when_a_lead_pulls_away(self, model_stop):
+    # Experimental mode, rolling below walking pace with StarPilot's bit held back: a lead pulls away (the MPC's plan is under way)
+    # and the request turns slightly positive. If the model says stop (a red light), the stop goes on: nothing asks to accelerate
+    # and the bit rises as the wheels stop. Otherwise the car follows the lead, StarPilot's held bit unpublished
+    law = SmoothStops(DT_MDL, ACTION_T)
+    sm = self.sm(v_ego=0.25, a_ego=-0.2)
+    sm['selfdriveState'] = NS(experimentalMode=True)
+    sm['modelV2'] = NS(action=NS(shouldStop=model_stop))
+    kwargs = {'enabled': True, 'active': True, 'target_source': SOURCE.e2e, 'forcing': False}
+    assert law.sample(sm, target=-0.5, stopping=True, plan_speeds=[0.25, 0.0], **kwargs)[1] is False and law.landing
+    published = [law.sample(sm, target=0.05, stopping=True, plan_speeds=[0.25, 3.0], **kwargs) for _ in range(4)]
+    if model_stop:
+      assert law.landing and all(target <= 0.0 and bit is False for target, bit in published)
+      sm['carState'] = NS(vEgo=0.0, aEgo=0.0, standstill=True)
+      assert law.sample(sm, target=0.05, stopping=True, plan_speeds=[0.25, 3.0], **kwargs)[1] is True
+    else:
+      assert not law.landing and published == [(0.05, False)] * 4
+
+  def test_the_planners_effective_delay_moves_the_corridor_edges(self):
+    # testing's developer delay override reaches the landing through the planner's own action_t
+    law = SmoothStops(DT_MDL, ACTION_T)
+    before = list(law.bound_bp)
+    law.sample(self.sm(), target=-0.9, stopping=False, enabled=True, active=True, plan_speeds=[1.0, 0.0], target_source=SOURCE.lead0,
+               forcing=False, action_t=ACTION_T + 0.2)
+    assert law.action_t == ACTION_T + 0.2 and law.bound_bp[0] > before[0]
 
   def test_owner_only_for_supported_cars_with_starpilot_longitudinal(self):
     cp = CarInterface.get_non_essential_params(CAR.HYUNDAI_PALISADE)
