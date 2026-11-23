@@ -56,6 +56,8 @@ LEAD_ABSENCE_TIME = 0.35     # s a lead's requirement is kept after its reading 
 STANDSTILL_SPEED = 0.10      # m/s, about the car's standstill flag (0.104 m/s of wheel speed on Hyundai)
 URGENT_DECEL = 2.0           # m/s^2, a plan asking this much ...
 URGENT_TIME = 0.1            # s ... for this long passes unchanged for as long as it asks; the landing then takes the tail back
+URGENT_CLEAR = 0.2           # m/s^2 the plan must ease above URGENT_DECEL before the demand counts as over, so a plan near it
+URGENT_RELEASE_JERK = 1.5    # m/s^3 does not chatter; braking then comes off no faster than this toward the corridor
 CRAWL_BIT_SPEED = 0.05       # m/s, below walking pace the stop bit waits for this (or the standstill flag) ...
 CRAWL_TIME = 1.0             # s ... or for the car to have crawled under STANDSTILL_SPEED this long
 ANCHOR_TIME = 0.15           # s StarPilot's own stop bit must stay up before its stop counts: a blip of the bit is not a stop
@@ -168,7 +170,7 @@ class SmoothStops:
     self.committed = False
     self.stop_target = None
     self.going = self.stopping = False
-    self.urgent = False
+    self.urgent = self.urgent_release = False
     self.slow_time = 0.0
     self.launching = False
     self.stop_bit = False
@@ -228,8 +230,9 @@ class SmoothStops:
     h = 0.02
     v, x, t = v_ego, 0.0, 0.0
     a = a_ego if a_ego is not None and math.isfinite(a_ego) else request
+    start = min(request, 0.0)
     while v > 0.0 and t < 10.0:
-      target = max(min(request, 0.0) - self.stopping_decel_rate * t, self.stop_accel)
+      target = min(start, max(start - self.stopping_decel_rate * t, self.stop_accel))
       a += (target - a) * min(h / self.action_t, 1.0)
       x += max(v + 0.5 * a * h, 0.0) * h
       v += a * h
@@ -345,7 +348,8 @@ class SmoothStops:
         self.held_time += self.dt
       self._urgent = self._urgent + 1 if a_target < -URGENT_DECEL else 0
       # a demand of URGENT_DECEL or more passes unchanged while it lasts; the landing takes the tail back once it eases
-      self.urgent = self._urgent >= self.urgent_frames or (self.urgent and a_target < -URGENT_DECEL)
+      self.urgent = self._urgent >= self.urgent_frames or (self.urgent and a_target < -(URGENT_DECEL - URGENT_CLEAR))
+      self.urgent_release |= self.urgent
       self.slow_time = self.slow_time + self.dt if v_ego <= STANDSTILL_SPEED else 0.0
       self.overrun_decel = self.overrun_requirement(v_ego, self.plan_stop(v_ego, a_target, model), a_ego) if rolling else 0.0
       self.exit_reason = 'go' if not intent else self._exit_reason(a_target, v_ego)
@@ -366,7 +370,7 @@ class SmoothStops:
       self.model_anchor = math.inf
       self.bit_frames = 0
       self._urgent = 0
-      self.urgent = False
+      self.urgent = self.urgent_release = False
       self.slow_time = 0.0
       plan = self.starpilot_request(v_ego, a_target, stopping, a_ego)
       self.overrun_decel = self.overrun_requirement(v_ego, self.plan_stop(v_ego, a_target, model), a_ego) if rolling else 0.0
@@ -386,7 +390,18 @@ class SmoothStops:
       plan = min(plan, 0.0) if self.committed or stopping else plan
       press = self.integral if rolling else 0.0
       bound = max(self.bound(v_ego), self.required_decel, self.overrun_decel)
-      output = plan if self.urgent else max(plan, -bound)
+      if self.urgent:
+        # an urgent demand passes as StarPilot itself would send it: its plan, or its stopping state, which keeps a request already
+        # below stopAccel (see starpilot_request)
+        output = plan
+      else:
+        output = max(plan, -bound)
+        if self.urgent_release:
+          # once it eases, braking comes off at URGENT_RELEASE_JERK instead of stepping to the corridor, but never stays harder
+          # than StarPilot itself now asks
+          eased = max(plan, min(output, self._last_output + URGENT_RELEASE_JERK * self.dt))
+          self.urgent_release = eased < output
+          output = eased
       if press > 0.0:
         output = min(output, -(min(max(-plan, 0.0), self.floor(v_ego)) + press))
       output = max(output, ACCEL_MIN)
@@ -418,7 +433,9 @@ class SmoothStops:
       self._rise_request = min(a_target, 0.0)
     if self.bit_frames < self.anchor_frames:
       return a_target
-    self.ramp_request = max(self._rise_request - self.stopping_decel_rate * (self.bit_frames - 1) * self.dt, self.stop_accel)
+    # LongControl's stopping state ramps toward stopAccel, but keeps a request already below it
+    self.ramp_request = min(self._rise_request,
+                            max(self._rise_request - self.stopping_decel_rate * (self.bit_frames - 1) * self.dt, self.stop_accel))
     if self.ramp_anchor is None:
       self.ramp_anchor = self.travelled + self.ramp_rest(v_ego, a_ego, self.ramp_request)
     return self.ramp_request

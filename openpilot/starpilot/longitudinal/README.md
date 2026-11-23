@@ -214,7 +214,8 @@ stop back and the car rests at most a few centimetres further past it than today
 stops end 1.5-3.4 m short of that line, so a landed one can end that much nearer it. Any other stop rests at most 0.5 m further on than where StarPilot's stopping ramp would have ended
 it, counted from the moment StarPilot's bit has stayed up 0.15 s; easing before that moment is not bounded, so the simulated worst
 case is 0.73 m. It never rests past the model's own stop point, and a radar lead always keeps 2 m after the actuator delay. Where the
-soft end no longer fits, the landing eases less. A demand of 2 m/s² or more passes unchanged while it lasts, and the landing takes the tail back once it eases, within the
+soft end no longer fits, the landing eases less. A demand of 2 m/s² or more passes exactly as StarPilot would send it while it lasts (its stopping state keeps a request already below
+stopAccel); once it has eased under 1.8 m/s² the landing lets braking off at 1.5 m/s³ and takes the tail back, within the
 model's own stop point. A landing hands the stop back when the plan no longer means to stop, when a lead is closer than the kiss can stop short of, when no room is left, or when the car keeps not slowing; the plan's
 request then passes unchanged, and if StarPilot's bit is already up LongControl's ramp continues from the request last sent. A plan
 asking to move ends a landing only when the plan is under way or StarPilot's bit is down; StarPilot's held bit then stays

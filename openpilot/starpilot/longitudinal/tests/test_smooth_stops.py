@@ -11,7 +11,8 @@ from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.starpilot.longitudinal.smooth_stops import (CREEP_FADE_SPEED, CREEP_SPEED, KISS_DECEL, KISS_SPEED, LANDING_SPEED,
                                                            LEAD_ABSENCE_TIME, LEAD_STANDING_GAP, LEEWAY, STALL_MAX, CRAWL_BIT_SPEED, CRAWL_TIME,
-                                                           STANDSTILL_SPEED, URGENT_DECEL, URGENT_TIME, Lead, SmoothStops,
+                                                           STANDSTILL_SPEED, URGENT_DECEL, URGENT_RELEASE_JERK, URGENT_TIME, Lead,
+                                                           SmoothStops,
                                                            corridor_distance, landing_bound, landing_floor, owner_for)
 from openpilot.starpilot.longitudinal.smooth_stops_preferences import KEY, SmoothStopsPreferences, supported
 
@@ -163,7 +164,25 @@ class TestHandBack:
     urgent = -(URGENT_DECEL + 0.5)
     outputs = [step(law, urgent, 2.5) for _ in range(frames(1.0))]
     assert law.landing and all(bit is False for _, bit in outputs) and outputs[-1][0] == urgent
-    assert step(law, -0.6, 0.6)[0] > -0.6 and law.landing
+    # once it eases, the output never stays harder than the plan, and braking comes off below the plan at the release jerk rather
+    # than stepping to the corridor
+    eased = [step(law, -0.6, 0.6)[0] for _ in range(frames(2.0))]
+    steps = [b - a for a, b in zip(eased, eased[1:], strict=False)]
+    assert eased[0] == pytest.approx(-0.6) and max(steps) <= URGENT_RELEASE_JERK * DT_MDL + 1e-9
+    assert all(e >= -0.6 - 1e-9 for e in eased) and eased[-1] > -0.6 and law.landing
+
+  def test_a_plan_hovering_at_the_urgent_threshold_does_not_chatter(self):
+    law = landing(3.0, -1.0)
+    outputs = [step(law, -URGENT_DECEL + (0.05 if i % 2 else -0.05), 2.0)[0] for i in range(frames(2.0))]
+    steps = [abs(b - a) for a, b in zip(outputs, outputs[1:], strict=False)]
+    assert max(steps) <= 0.1 + 1e-9, max(steps)
+
+  def test_the_stopping_ramp_keeps_a_request_already_below_stop_accel(self):
+    # LongControl's stopping state keeps an output already below stopAccel, so StarPilot's own stop from -3.0 stays at -3.0
+    law = landing(3.0, -1.0)
+    for _ in range(frames(1.0)):
+      step(law, -3.0, 3.0, stopping=True, a_ego=-3.0)
+    assert law.ramp_request == -3.0
   def test_a_lead_the_kiss_cannot_stop_short_of_hands_back(self):
     law = landing(0.8, -0.6)
     assert out(law, -0.6, 0.8, leads(6.0)) > -0.6 and law.landing

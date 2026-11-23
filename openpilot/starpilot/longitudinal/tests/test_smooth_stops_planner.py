@@ -336,6 +336,31 @@ def test_an_enhanced_stops_bit_raised_at_speed_is_landed(bit_speed, shortfall, c
   # a brake too weak to stop short of the line hands the stop back to StarPilot's own ramp: no softer, never harder
 
 
+def late_commit(v0, line, smooth, commit_frame=10, seconds=14.0):
+  # Enhanced Stops commits late at speed: the line is close, its plan asks 3 m/s^2 or more and StarPilot's bit rises at once
+  drive = Drive(v0, smooth=smooth)
+  at = None
+  for _ in range(round(seconds / DT_MDL)):
+    model_ns = BASE_NS + drive.frame * 50_000_000 - 10_000_000
+    if drive.frame < commit_frame:
+      plan = StopPlan(model_ns)
+    else:
+      at = drive.x + line if at is None else at
+      left = at - drive.x
+      ceiling = math.sqrt(2.0 * 0.65 * max(left - 6.0, 0.0))
+      plan = StopPlan(model_ns, ceiling, max(0.0, left * 0.93), True, ceiling <= 0.5, max(0.0, left), 0.0, 0.32, False,
+                      target_m=max(0.0, left))
+    drive.step(force_stop=plan, v_cruise=max(v0, 3.0))
+  return drive.rest[1] - at, drive.peaks()[0]
+
+
+@pytest.mark.parametrize('v0,line', [(6.0, 8.0), (7.0, 8.0), (8.0, 8.0), (8.0, 10.0), (8.0, 14.0)])
+def test_a_late_enhanced_stops_commit_at_speed_is_braked_in_full(v0, line):
+  # a hard demand passes in full, StarPilot's own stopping state included, so the car never ends further past the line than off
+  (off_past, off_peak), (on_past, on_peak) = (late_commit(v0, line, smooth) for smooth in (False, True))
+  assert on_past <= off_past + 0.1 and on_peak >= off_peak - 0.1, (off_past, on_past, off_peak, on_peak)
+
+
 @pytest.mark.parametrize('event', ['force_decel', 'fcw'])
 def test_forcedecel_or_fcw_mid_landing_hands_the_stop_back_at_once(event):
   drive = Drive(2.0, smooth=True)
