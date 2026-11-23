@@ -7,6 +7,7 @@ import numpy as np
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.drive_helpers import should_stop
 from openpilot.starpilot.longitudinal.smooth_stops_preferences import supported
 
@@ -25,13 +26,15 @@ from openpilot.starpilot.longitudinal.smooth_stops_preferences import supported
 # plan asks to move.
 #
 # The rest point is bounded: an Enhanced Stops commitment does not rest past its own stop point (the tracked line moved by its Stop
-# Distance Adjustment) unless StarPilot's own stop already would, in which case the overrun hand-back returns the stop; any other
+# Distance Adjustment), or, where the model's request sets the plan and places the stop further on, past the further of that point
+# and LEEWAY beyond where StarPilot's stopping ramp would have ended it (its point is a countdown that can read short); any other
 # stop rests at most LEEWAY further on than where StarPilot's stopping ramp would have ended it, and never past the nearest point
-# the model's request has asked to stop at, both fixed to the road. Where the soft tail no longer fits,
+# the model's request has asked to stop at, all fixed to the road. Where the soft tail no longer fits,
 # the landing eases less, up to letting StarPilot's own request through unchanged. Whatever stops the car LEAD_STANDING_GAP short of
-# a radar lead passes as well. Anything a landing cannot absorb hands the stop back to StarPilot at once: the plan asking to move or
-# no longer meaning to stop, a demand of URGENT_DECEL or more, a lead closer than the kiss can stop short of, no room left inside
-# the bound, or a car that keeps not slowing (the press saturated). The plan's request then passes unchanged; if StarPilot's stop
+# a radar lead passes as well. A demand of URGENT_DECEL or more passes as asked at speed, and in its last part the car's braking
+# fades at URGENT_FADE_JERK to the kiss at rest, inside the same bounds. Anything a landing cannot absorb hands the stop back to
+# StarPilot at once: the plan asking to move or no longer meaning to stop, a lead closer than the kiss can stop short of, no room
+# left inside the bound, or a car that keeps not slowing (the press saturated). The plan's request then passes unchanged; if StarPilot's stop
 # bit is already up, LongControl's stopping ramp continues from the request last sent at its usual rate. A launch hand-back keeps
 # StarPilot's held bit unpublished while the plan asks to move and is under way, and a bit StarPilot has published is never
 # withdrawn by a later landing.
@@ -55,14 +58,15 @@ LEAD_STANDING_GAP = 2.0
 LEAD_ABSENCE_TIME = 0.35     # s a lead's requirement is kept after its reading drops out
 STANDSTILL_SPEED = 0.10      # m/s, about the car's standstill flag (0.104 m/s of wheel speed on Hyundai)
 URGENT_DECEL = 2.0           # m/s^2, a plan asking this much ...
-URGENT_TIME = 0.1            # s ... for this long passes unchanged for as long as it asks; the landing then takes the tail back
+URGENT_TIME = 0.1            # s ... for this long passes as asked while it asks, except that the car's braking fades at ...
+URGENT_FADE_JERK = 2.0       # m/s^3 ... this to the kiss at rest; the landing then takes the tail back
 URGENT_CLEAR = 0.2           # m/s^2 the plan must ease above URGENT_DECEL before the demand counts as over, so a plan near it
 URGENT_RELEASE_JERK = 1.5    # m/s^3 does not chatter; braking then comes off no faster than this toward the corridor
 CRAWL_BIT_SPEED = 0.05       # m/s, below walking pace the stop bit waits for this (or the standstill flag) ...
 CRAWL_TIME = 1.0             # s ... or for the car to have crawled under STANDSTILL_SPEED this long
 ANCHOR_TIME = 0.15           # s StarPilot's own stop bit must stay up before its stop counts: a blip of the bit is not a stop
 # A far backstop for a car that is neither slowing nor running out of room; the leeway, not this, bounds a stop
-HOLD_DISTANCE = 10.0         # m, the most the car travels with StarPilot's own stop bit held back ...
+HOLD_DISTANCE = 10.0         # m, the most the car travels with StarPilot's own stop bit held back, past its own stop's roll ...
 HOLD_TIME = 10.0             # s ... and for how long
 # Anti-stall: while rolling, the car's shortfall against the floor presses both edges toward more braking and drains as the car
 # slows again. It fades out with the floor and is not applied at rest. A press that reaches STALL_MAX hands the stop back
@@ -109,6 +113,22 @@ def stop_within(speed, room):
 def held_stop_distance(v_ego, a_target):
   # where the planner's request, held, would bring the car to rest
   return v_ego * v_ego / (-2.0 * a_target) if a_target < -1e-3 else math.inf
+
+
+def urgent_request(v_ego, action_t):
+  # the most braking requested at this speed through an urgent demand: the car's braking falls at URGENT_FADE_JERK to the kiss at
+  # rest, sqrt(KISS_DECEL^2 + 2 * URGENT_FADE_JERK * v), and riding that edge it falls by URGENT_FADE_JERK * action_t while a request
+  # is on its way, so the request leads it by that much
+  return max(math.sqrt(KISS_DECEL * KISS_DECEL + 2.0 * URGENT_FADE_JERK * max(v_ego, 0.0)) - URGENT_FADE_JERK * action_t, KISS_DECEL)
+
+
+def _num(value):
+  # a diagnostic value that reads back as JSON
+  try:
+    value = float(value)
+  except (TypeError, ValueError):
+    return None
+  return round(value, 3) if math.isfinite(value) else None
 
 def request_breakpoints(bp, values, action_t, steps=100):
   # each breakpoint below LANDING_SPEED moves up to the speed from which a car riding that edge reaches it after action_t
@@ -184,6 +204,9 @@ class SmoothStops:
     self.held_time = 0.0
     self.travelled = 0.0
     self.ramp_anchor = None
+    self.passing = self.settled = False
+    self.anchor_reads = 0
+    self.rise_travelled = 0.0
     self.model_anchor = math.inf
     self.plan_target = None
     self._urgent = 0
@@ -211,6 +234,15 @@ class SmoothStops:
   def floor(self, v_ego):
     # the least braking requested at this speed through a landing
     return float(np.interp(v_ego, self.floor_bp, FLOOR_V))
+
+  def note(self, change, v_ego, a_target, output=None, **extra):
+    # one line per change of a landing's state, in the rlog's logMessage
+    cloudlog.event('smooth_stops', change=change, v=_num(v_ego), plan=_num(a_target), out=_num(output),
+                   target_m=_num(self.stop_target), committed=self.committed, stopping=self.stopping,
+                   anchor_m=_num(self.ramp_anchor - self.travelled if self.ramp_anchor is not None else None),
+                   model_m=_num(self.model_anchor - self.travelled), travelled=_num(self.travelled),
+                   overrun=_num(self.overrun_decel) if self.overrun_decel != math.inf else 'inf',
+                   required=_num(self.required_decel), press=_num(self.integral), **extra)
 
   def lead_requirement(self, v_ego, lead):
     # the braking that stops the car LEAD_STANDING_GAP behind the lead, or behind where a braking lead will come to rest, in the
@@ -241,17 +273,28 @@ class SmoothStops:
   def overrun_requirement(self, v_ego, plan_stop, a_ego=None):
     # the braking that brings the car to rest within LEEWAY of the plan's own stop point once the requests already on their way
     # have played out: none while riding the corridor rests inside it, else what sheds the extra speed before the kiss, or, with
-    # no room for the kiss, what stops the car in the room left
+    # no room for the kiss, what stops the car in the room left. Until then the car slows as it is now; its speed after that is
+    # counted only against StarPilot's own stop read from how this car is slowing (settled), else the speed now stands in for it,
+    # which leaves room for a brake that delivers less than asked
     slowing = min(a_ego, 0.0) if a_ego is not None and math.isfinite(a_ego) else 0.0
-    room = plan_stop + LEEWAY - max(v_ego * self.action_t + 0.5 * slowing * self.action_t ** 2, 0.0)
+    if self.settled:
+      if self._last_output is not None and math.isfinite(self._last_output):
+        # ... or as the last request asks, if that is less
+        slowing = max(slowing, min(self._last_output, 0.0))
+      t = self.action_t if slowing >= 0.0 else min(self.action_t, v_ego / -slowing)
+      room = plan_stop + LEEWAY - (v_ego * t + 0.5 * slowing * t * t)
+      v = v_ego + slowing * t
+    else:
+      room = plan_stop + LEEWAY - max(v_ego * self.action_t + 0.5 * slowing * self.action_t ** 2, 0.0)
+      v = v_ego
     if room <= 0.0:
       return math.inf
-    if corridor_distance(v_ego) <= room:
+    if corridor_distance(v) <= room:
       return 0.0
     # shedding the speed before the kiss is asked only up to the corridor's own bound: beyond that, with the car still answering
     # the last request, the plain stop in the room left is what is needed
-    shed = (v_ego * v_ego - KISS_SPEED * KISS_SPEED) / (2.0 * (room - KISS_DISTANCE)) if v_ego > KISS_SPEED and room > KISS_DISTANCE else 0.0
-    return max(stop_within(v_ego, room), min(shed, self.bound(v_ego)))
+    shed = (v * v - KISS_SPEED * KISS_SPEED) / (2.0 * (room - KISS_DISTANCE)) if v > KISS_SPEED and room > KISS_DISTANCE else 0.0
+    return max(stop_within(v, room), min(shed, self.bound(v_ego)))
 
   def sample(self, sm, *, target, stopping, enabled, active, plan_speeds, target_source, forcing, stop_target=None, action_t=None):
     """The planner's hook: returns (target, stopping) untouched unless Smooth Stops is enabled, the planner allows it and a
@@ -260,6 +303,8 @@ class SmoothStops:
     effective actuator delay."""
     if not (enabled and active):
       if not self.idle:
+        if self.landing:
+          self.note('exit', None, target, target, reason='inactive')
         self.reset()
       self._last_output, self._last_bit = target, bool(stopping)
       return target, stopping
@@ -347,8 +392,12 @@ class SmoothStops:
         self.held_distance += v_ego * self.dt
         self.held_time += self.dt
       self._urgent = self._urgent + 1 if a_target < -URGENT_DECEL else 0
-      # a demand of URGENT_DECEL or more passes unchanged while it lasts; the landing takes the tail back once it eases
-      self.urgent = self._urgent >= self.urgent_frames or (self.urgent and a_target < -(URGENT_DECEL - URGENT_CLEAR))
+      # a demand of URGENT_DECEL or more passes as asked while it lasts, but for its soft ending; the landing takes the tail back
+      # once it eases
+      urgent = self._urgent >= self.urgent_frames or (self.urgent and a_target < -(URGENT_DECEL - URGENT_CLEAR))
+      if urgent != self.urgent:
+        self.urgent = urgent
+        self.note('urgent_on' if urgent else 'urgent_off', v_ego, a_target)
       self.urgent_release |= self.urgent
       self.slow_time = self.slow_time + self.dt if v_ego <= STANDSTILL_SPEED else 0.0
       self.overrun_decel = self.overrun_requirement(v_ego, self.plan_stop(v_ego, a_target, model), a_ego) if rolling else 0.0
@@ -359,6 +408,7 @@ class SmoothStops:
         self.launching = self.exit_reason == 'launch' and going and rolling and not self.stop_bit
         self.landing = False
         self.handed_back = True
+        self.note('exit', v_ego, a_target, a_target, reason=self.exit_reason, urgent=self.urgent)
     elif (not self.handed_back and not self._last_bit and (v_ego < LANDING_SPEED or stopping) and intent and
           (a_target < -KISS_DECEL or committed and stopping)):
       self.landing = True
@@ -367,13 +417,16 @@ class SmoothStops:
       self.integral = 0.0
       self.held_distance = self.held_time = self.travelled = 0.0
       self.ramp_anchor = self.ramp_request = None
+      self.passing, self.settled = True, False
+      self.rise_travelled = 0.0
       self.model_anchor = math.inf
-      self.bit_frames = 0
+      self.bit_frames = self.anchor_reads = 0
       self._urgent = 0
       self.urgent = self.urgent_release = False
       self.slow_time = 0.0
       plan = self.starpilot_request(v_ego, a_target, stopping, a_ego)
       self.overrun_decel = self.overrun_requirement(v_ego, self.plan_stop(v_ego, a_target, model), a_ego) if rolling else 0.0
+      self.note('start', v_ego, a_target, model=model)
     if not self.landing:
       # after a launch hand-back, StarPilot's held bit stays unpublished while the plan asks to move and is going
       if self.launching and stopping and a_target > 0.0 and going:
@@ -389,13 +442,13 @@ class SmoothStops:
       # asks, so the landing never asks to accelerate
       plan = min(plan, 0.0) if self.committed or stopping else plan
       press = self.integral if rolling else 0.0
-      bound = max(self.bound(v_ego), self.required_decel, self.overrun_decel)
       if self.urgent:
-        # an urgent demand passes as StarPilot itself would send it: its plan, or its stopping state, which keeps a request already
-        # below stopAccel (see starpilot_request)
-        output = plan
+        # an urgent demand passes as StarPilot itself would send it (its plan, or its stopping state, which keeps a request already
+        # below stopAccel, see starpilot_request) until the car's braking would have to fade to reach the kiss at rest; what a lead
+        # or the bound on the rest point needs still passes
+        output = max(plan, -max(urgent_request(v_ego, self.action_t), self.required_decel, self.overrun_decel))
       else:
-        output = max(plan, -bound)
+        output = max(plan, -max(self.bound(v_ego), self.required_decel, self.overrun_decel))
         if self.urgent_release:
           # once it eases, braking comes off at URGENT_RELEASE_JERK instead of stepping to the corridor, but never stays harder
           # than StarPilot itself now asks
@@ -405,6 +458,8 @@ class SmoothStops:
       if press > 0.0:
         output = min(output, -(min(max(-plan, 0.0), self.floor(v_ego)) + press))
       output = max(output, ACCEL_MIN)
+      # while every request sent is StarPilot's own, the car is making StarPilot's own stop (see starpilot_request)
+      self.passing = self.passing and output == plan
     else:
       # the wheels have stopped under the kiss and the stop bit is up: LongControl's stopping state holds the car and the plan
       # passes as it is, so the car launches from rest when it would without Smooth Stops
@@ -416,43 +471,56 @@ class SmoothStops:
     else:
       # rises as the wheels stop and stays up, through wheel-speed ticks at rest, until the plan asks to move
       bit = stopping or should_stop(v_ego, a_target)
+      if bit and not self.stop_bit:
+        self.note('bit', v_ego, a_target, output)
       self.stop_bit |= bit
     self._last_output, self._last_bit = output, bit
     return output, bit
 
   def starpilot_request(self, v_ego, a_target, stopping, a_ego):
     # what StarPilot itself would ask now: its plan, or once its own stop bit has stayed up ANCHOR_TIME, LongControl's stopping ramp
-    # from the plan's request at the rise toward stopAccel. Where that ramp would end the stop is fixed to the road then; the bit
-    # dropping again clears both
+    # from the plan's request at the rise toward stopAccel. Where that ramp would end the stop is fixed to the road then, and while
+    # the landing has sent only StarPilot's own requests it is read again from how the car is actually slowing, so a brake that
+    # delivers less than asked does not leave it short; the bit dropping again clears both
     if not stopping:
-      self.bit_frames = 0
+      self.bit_frames = self.anchor_reads = 0
       self.ramp_request = self.ramp_anchor = None
       return a_target
     self.bit_frames += 1
     if self.bit_frames == 1:
       self._rise_request = min(a_target, 0.0)
+      self.rise_travelled = self.travelled
     if self.bit_frames < self.anchor_frames:
       return a_target
     # LongControl's stopping state ramps toward stopAccel, but keeps a request already below it
     self.ramp_request = min(self._rise_request,
                             max(self._rise_request - self.stopping_decel_rate * (self.bit_frames - 1) * self.dt, self.stop_accel))
-    if self.ramp_anchor is None:
+    if self.ramp_anchor is None or self.passing:
       self.ramp_anchor = self.travelled + self.ramp_rest(v_ego, a_ego, self.ramp_request)
+      self.anchor_reads += int(self.passing)
     return self.ramp_request
 
   def plan_stop(self, v_ego, a_target, model):
     # how far ahead StarPilot itself would bring the car to rest, fixed to the road so a car that keeps rolling uses it up: where its
     # stopping ramp would have ended the stop, and the nearest point the model's request, held once the car answers it, has asked
     # to stop at (negative once the car has passed it)
-    if self.committed and self.stop_target is not None:
-      # an Enhanced Stops commitment knows its own stop point; the landing may use it all but never pass it
-      return self.stop_target - LEEWAY
-    # approaching a light Enhanced Stops tracks, the landing never passes its line either
-    line = self.stop_target - LEEWAY if self.stop_target is not None else math.inf
     if model:
       # the model's request rises against a car that falls behind its stop point, so a model stop gets no leeway past that point
       self.model_anchor = min(self.model_anchor, self.travelled + v_ego * self.action_t + held_stop_distance(v_ego, a_target) - LEEWAY)
-    return min(min(self.ramp_anchor if self.ramp_anchor is not None else math.inf, self.model_anchor) - self.travelled, line)
+    ramp = self.ramp_anchor - self.travelled if self.ramp_anchor is not None else math.inf
+    own = min(ramp, self.model_anchor - self.travelled)
+    if self.committed and self.stop_target is not None:
+      # an Enhanced Stops commitment knows its own stop point and the landing may use it all. That point is a countdown that can read
+      # short, so where the model's request sets the plan and places the stop further on, StarPilot's own stop (its stopping ramp
+      # from its bit, plus LEEWAY, short of the model's point) bounds it instead; otherwise StarPilot's stop past that point is handed
+      # back as it is
+      extend = self.ramp_anchor is not None and self.model_anchor < math.inf
+      stop = max(self.stop_target - LEEWAY, own if extend else -math.inf)
+    else:
+      # approaching a light Enhanced Stops tracks, the landing never passes its line either
+      stop = min(own, self.stop_target - LEEWAY if self.stop_target is not None else math.inf)
+    self.settled = stop == ramp and self.anchor_reads >= self.anchor_frames
+    return stop
   def _exit_reason(self, a_target, v_ego):
     # a plan asking to move ends the landing when the plan is under way or StarPilot's own bit is down; a plan barely positive under
     # StarPilot's bit (a lead creeping, the model's red light) is still StarPilot's stop, and the landing keeps easing it to rest
@@ -466,7 +534,9 @@ class SmoothStops:
       return 'overrun'
     if self.integral >= STALL_MAX - 1e-9:
       return 'stall'
-    # (summed per frame: allow for the float sum landing a hair short of the budget)
-    if self.held_distance >= HOLD_DISTANCE - 1e-6 or self.held_time >= HOLD_TIME - 1e-6:
+    # (summed per frame: allow for the float sum landing a hair short of the budget). The distance counts beyond what StarPilot's own
+    # stop would have rolled with its bit up, so a commitment made at speed is not handed back near the end of its own stop
+    rolled = self.ramp_anchor - self.rise_travelled if self.ramp_anchor is not None else 0.0
+    if self.held_distance - rolled >= HOLD_DISTANCE - 1e-6 or self.held_time >= HOLD_TIME - 1e-6:
       return 'hold'
     return ''

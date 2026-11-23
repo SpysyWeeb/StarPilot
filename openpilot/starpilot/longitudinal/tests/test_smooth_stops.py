@@ -1,5 +1,8 @@
+import json
+import logging
 import math
 from types import SimpleNamespace as NS
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -8,12 +11,14 @@ from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR
 from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.cereal import log
+from openpilot.common.logging_extra import SwagFormatter
 from openpilot.common.realtime import DT_MDL
+from openpilot.common.swaglog import cloudlog
 from openpilot.starpilot.longitudinal.smooth_stops import (CREEP_FADE_SPEED, CREEP_SPEED, KISS_DECEL, KISS_SPEED, LANDING_SPEED,
                                                            LEAD_ABSENCE_TIME, LEAD_STANDING_GAP, LEEWAY, STALL_MAX, CRAWL_BIT_SPEED, CRAWL_TIME,
-                                                           STANDSTILL_SPEED, URGENT_DECEL, URGENT_RELEASE_JERK, URGENT_TIME, Lead,
-                                                           SmoothStops,
-                                                           corridor_distance, landing_bound, landing_floor, owner_for)
+                                                           STANDSTILL_SPEED, URGENT_DECEL, URGENT_FADE_JERK, URGENT_RELEASE_JERK,
+                                                           URGENT_TIME, Lead, SmoothStops,
+                                                           corridor_distance, landing_bound, landing_floor, owner_for, urgent_request)
 from openpilot.starpilot.longitudinal.smooth_stops_preferences import KEY, SmoothStopsPreferences, supported
 
 NOW = 100_000_000_000
@@ -157,19 +162,50 @@ class TestHandBack:
     assert step(law, -0.4, 0.9, intent=False) == (-0.4, False)
     assert law.exit_reason == 'go'
 
-  def test_a_sudden_hard_demand_passes_unchanged_and_the_tail_is_landed(self):
-    # the road's model stops asking 2-3 m/s^2: the hard braking passes as it is for as long as it is asked, without the stop bit,
-    # and once it eases the landing takes the tail back
+  def test_a_sudden_hard_demand_passes_at_speed_and_the_tail_is_landed(self):
+    # the road's model stops asking 2-3 m/s^2: the hard braking passes as it is while the car is fast enough to fade from it, without
+    # the stop bit, and once it eases the landing takes the tail back
     law = landing(3.0, -1.0)
     urgent = -(URGENT_DECEL + 0.5)
-    outputs = [step(law, urgent, 2.5) for _ in range(frames(1.0))]
-    assert law.landing and all(bit is False for _, bit in outputs) and outputs[-1][0] == urgent
+    assert urgent_request(3.4, ACTION_T) > -urgent
+    outputs = [step(law, urgent, 3.4) for _ in range(frames(1.0))]
+    assert law.landing and law.urgent and all(bit is False for _, bit in outputs) and outputs[-1][0] == urgent
     # once it eases, the output never stays harder than the plan, and braking comes off below the plan at the release jerk rather
     # than stepping to the corridor
     eased = [step(law, -0.6, 0.6)[0] for _ in range(frames(2.0))]
     steps = [b - a for a, b in zip(eased, eased[1:], strict=False)]
     assert eased[0] == pytest.approx(-0.6) and max(steps) <= URGENT_RELEASE_JERK * DT_MDL + 1e-9
     assert all(e >= -0.6 - 1e-9 for e in eased) and eased[-1] > -0.6 and law.landing
+
+  @pytest.mark.parametrize('committed', [False, True])
+  def test_an_urgent_demand_held_to_rest_still_fades_to_the_kiss(self, committed):
+    # the road's 0d 12:35: the model asks 2.4 m/s^2 down to walking pace. The braking requested never exceeds the plan, follows the
+    # fade sqrt(KISS^2 + 2 j v) one actuator delay ahead, and reaches the kiss before the wheels stop
+    law = landing(3.0, -1.0)
+    plan, target = -2.4, 50.0 if committed else None
+    for _ in range(frames(URGENT_TIME) + 1):
+      step(law, plan, 3.4, a_ego=plan, committed=committed, stop_target=target)
+    for v in np.arange(3.4, CRAWL_BIT_SPEED, -2.4 * DT_MDL):
+      result, bit = step(law, plan, float(v), a_ego=plan, committed=committed, stop_target=target)
+      assert law.landing and law.urgent and result >= plan - 1e-9 and not bit
+      fade = math.sqrt(KISS_DECEL ** 2 + 2.0 * URGENT_FADE_JERK * v) - URGENT_FADE_JERK * ACTION_T
+      assert result == pytest.approx(max(plan, -max(fade, KISS_DECEL)))
+      if v < 0.38:
+        assert result == pytest.approx(-KISS_DECEL)
+
+  def test_an_urgent_demand_still_gets_the_braking_a_lead_or_the_line_needs(self):
+    # a lead the corridor cannot stop short of hands the stop back, so StarPilot's plan passes in full
+    law = landing(1.5, -1.0)
+    for _ in range(frames(0.3)):
+      result = out(law, -3.0, 1.5)
+    assert law.landing and law.urgent and result > -3.0
+    assert out(law, -3.0, 1.5, leads(LEAD_STANDING_GAP + 1.5)) == -3.0 and law.exit_reason == 'lead'
+    # an Enhanced Stops line closer than the fade can stop at gets the braking that stops the car within it
+    law = landing(1.5, -1.0)
+    for _ in range(frames(0.3)):
+      result = step(law, -3.0, 1.5, a_ego=-0.5, committed=True, stop_target=1.2)[0]
+    assert law.landing and law.urgent and law.overrun_decel > urgent_request(1.5, ACTION_T)
+    assert result == pytest.approx(-law.overrun_decel) and result > -3.0
 
   def test_a_plan_hovering_at_the_urgent_threshold_does_not_chatter(self):
     law = landing(3.0, -1.0)
@@ -503,6 +539,155 @@ def test_lead_from_radar_reads_finite_filtered_values(acceleration):
   assert Lead.from_radar(NS(present=True, dRel=math.nan, vLeadK=0.0, aLeadK=0.0)) == Lead()
   assert Lead.from_radar(NS(present=False)) == Lead()
   assert Lead.from_radar(None) == Lead()
+
+
+# Two harsh round-7 road stops (drive 0000000d), Experimental mode, an Enhanced Stops episode, Stop Distance Adjustment -2 ft. One row
+# per model frame from the log: vEgo, aEgo, the plan, StarPilot's own stop bit, Enhanced Stops' target_m (rebuilt from its countdown
+# and the model's path end), and whether the model's request set the plan. At 48:06 the plan is the model's raw request where the
+# round-7 landing had published its copy of LongControl's -2.0 ramp
+LOGGED_4806 = (
+  (5.76, -1.45, -1.65, 0, 8.81, 0), (5.69, -1.42, -1.66, 0, 8.45, 0), (5.62, -1.43, -1.67, 0, 8.10, 0),
+  (5.54, -1.45, -1.69, 0, 7.75, 0), (5.48, -1.36, -1.71, 0, 7.41, 0), (5.40, -1.45, -1.73, 0, 7.07, 0),
+  (5.33, -1.58, -1.75, 0, 6.74, 0), (5.24, -1.63, -1.77, 0, 6.41, 0), (5.15, -1.60, -1.78, 1, 6.09, 0),
+  (5.07, -1.56, -1.80, 1, 5.77, 0), (4.99, -1.56, -1.82, 1, 5.46, 0), (4.92, -1.54, -1.90, 1, 5.15, 1),
+  (4.84, -1.52, -1.95, 1, 4.85, 1), (4.78, -1.57, -1.30, 1, 4.55, 1), (4.70, -1.46, -1.30, 1, 4.26, 1),
+  (4.64, -1.48, -1.31, 1, 3.97, 1), (4.56, -1.38, -1.32, 1, 3.68, 1), (4.47, -1.46, -1.33, 1, 3.41, 1),
+  (4.43, -1.44, -1.33, 1, 3.13, 1), (4.35, -1.46, -1.34, 1, 2.86, 1), (4.27, -1.45, -1.35, 1, 2.59, 1),
+  (4.19, -1.47, -1.35, 1, 2.33, 1), (4.12, -1.43, -1.35, 1, 2.07, 1), (4.05, -1.44, -1.36, 1, 1.82, 1),
+  (3.98, -1.50, -1.36, 1, 1.57, 1), (3.89, -1.50, -1.36, 1, 1.33, 1), (3.82, -1.44, -1.36, 1, 1.24, 1),
+  (3.76, -1.41, -1.36, 1, 1.24, 1), (3.67, -1.53, -1.36, 1, 1.24, 1), (3.59, -1.56, -1.36, 1, 1.24, 1),
+  (3.53, -1.56, -1.37, 1, 1.24, 1), (3.43, -1.62, -1.37, 1, 1.24, 1), (3.34, -1.64, -1.37, 1, 1.24, 1),
+  (3.27, -1.59, -1.37, 1, 1.24, 1), (3.19, -1.60, -1.38, 1, 1.24, 1), (3.12, -1.57, -1.38, 1, 1.24, 1),
+  (3.02, -1.66, -1.38, 1, 1.24, 1), (2.92, -1.76, -1.39, 1, 1.24, 1), (2.84, -1.70, -1.39, 1, 1.24, 1),
+  (2.77, -1.73, -1.39, 1, 1.24, 1), (2.66, -1.79, -1.39, 1, 1.24, 1), (2.57, -1.77, -1.39, 1, 1.24, 1),
+  (2.47, -1.86, -1.39, 1, 1.24, 1), (2.39, -1.80, -1.39, 1, 1.24, 1), (2.29, -1.85, -1.39, 1, 1.24, 1),
+  (2.19, -1.89, -1.39, 1, 1.24, 1), (2.10, -1.90, -1.38, 1, 1.24, 1), (2.01, -1.86, -1.37, 1, 1.24, 1),
+  (1.92, -1.86, -1.36, 1, 1.24, 1), (1.82, -1.86, -1.35, 1, 1.24, 1), (1.74, -1.81, -1.34, 1, 1.24, 1),
+  (1.63, -1.90, -1.33, 1, 1.24, 1), (1.52, -2.02, -1.31, 1, 1.24, 1), (1.42, -2.04, -1.30, 1, 1.24, 1),
+  (1.32, -2.04, -1.28, 1, 1.24, 1), (1.22, -1.97, -1.26, 1, 1.24, 1), (1.13, -1.89, -1.24, 1, 1.24, 1),
+  (1.02, -1.94, -1.21, 1, 1.24, 1), (0.94, -1.95, -1.18, 1, 1.24, 1), (0.85, -1.85, -1.15, 1, 1.24, 1),
+  (0.76, -1.81, -1.12, 1, 1.24, 1), (0.68, -1.75, -1.08, 1, 1.24, 1), (0.59, -1.73, -1.03, 1, 1.24, 1),
+  (0.53, -1.72, -0.98, 1, 1.24, 1), (0.43, -1.62, -0.92, 1, 1.24, 1), (0.36, -1.57, -0.86, 1, 1.24, 1),
+  (0.31, -1.47, -0.79, 1, 1.24, 1), (0.24, -1.29, -0.72, 1, 1.24, 1), (0.20, -1.10, -0.64, 1, 1.24, 1),
+  (0.17, -1.02, -0.55, 1, 1.24, 1), (0.13, -0.85, -0.46, 1, 1.24, 1), (0.11, -0.71, -0.39, 1, 1.24, 1),
+  (0.09, -0.58, -0.34, 1, 1.24, 1), (0.08, -0.43, -0.29, 1, 1.24, 1), (0.07, -0.31, -0.25, 1, 1.24, 1),
+  (0.07, -0.23, -0.21, 1, 1.24, 1), (0.06, -0.16, -0.18, 1, 1.24, 1), (0.06, -0.14, -0.15, 1, 1.24, 1),
+)
+LOGGED_1235 = (
+  (5.85, -2.10, -2.37, 0, 9.70, 1), (5.73, -2.19, -2.38, 0, 9.41, 1), (5.60, -2.20, -2.39, 0, 9.07, 1),
+  (5.50, -2.25, -2.39, 0, 8.79, 1), (5.39, -2.24, -2.40, 0, 8.41, 1), (5.29, -2.19, -2.40, 0, 7.97, 1),
+  (5.13, -2.36, -2.41, 0, 7.71, 1), (5.03, -2.42, -2.40, 0, 7.46, 1), (4.90, -2.49, -2.41, 0, 7.21, 1),
+  (4.78, -2.43, -2.40, 0, 6.97, 1), (4.65, -2.49, -2.40, 0, 6.74, 1), (4.51, -2.47, -2.40, 0, 6.49, 1),
+  (4.41, -2.48, -2.40, 1, 6.09, 1), (4.28, -2.48, -2.39, 1, 5.88, 1), (4.16, -2.45, -2.39, 1, 5.67, 1),
+  (4.03, -2.50, -2.38, 1, 5.47, 1), (3.91, -2.48, -2.37, 1, 5.27, 1), (3.76, -2.48, -2.36, 1, 5.08, 1),
+  (3.66, -2.50, -2.37, 1, 4.90, 1), (3.53, -2.55, -2.37, 1, 4.73, 1), (3.41, -2.50, -2.37, 1, 4.55, 1),
+  (3.28, -2.49, -2.37, 1, 4.39, 1), (3.16, -2.45, -2.37, 1, 4.23, 1), (3.01, -2.47, -2.37, 1, 4.08, 1),
+  (2.92, -2.44, -2.37, 1, 3.79, 1), (2.79, -2.46, -2.37, 1, 3.65, 1), (2.67, -2.42, -2.37, 1, 3.51, 1),
+  (2.53, -2.43, -2.37, 1, 3.39, 1), (2.41, -2.41, -2.37, 1, 3.27, 1), (2.30, -2.50, -2.37, 1, 2.98, 1),
+  (2.18, -2.47, -2.37, 1, 2.87, 1), (2.05, -2.56, -2.37, 1, 2.63, 1), (1.89, -2.60, -2.37, 1, 2.50, 1),
+  (1.78, -2.61, -2.37, 1, 2.38, 1), (1.63, -2.59, -2.37, 1, 2.30, 1), (1.53, -2.56, -2.37, 1, 2.22, 1),
+  (1.41, -2.53, -2.37, 1, 2.07, 1), (1.27, -2.58, -2.37, 1, 2.00, 1), (1.12, -2.58, -2.30, 1, 1.88, 1),
+  (1.02, -2.58, -2.22, 1, 1.83, 1), (0.90, -2.46, -2.15, 1, 1.79, 1), (0.78, -2.42, -2.07, 1, 1.75, 1),
+  (0.67, -2.35, -1.54, 1, 1.72, 1), (0.56, -2.26, -1.92, 1, 1.69, 1), (0.48, -2.03, -1.85, 1, 1.66, 1),
+  (0.39, -1.92, -1.77, 1, 1.60, 1), (0.31, -1.80, -1.70, 1, 1.58, 1), (0.23, -1.59, -1.62, 1, 1.57, 1),
+  (0.19, -1.38, -1.55, 1, 1.56, 1), (0.16, -1.08, -1.47, 1, 1.52, 1), (0.13, -0.86, -1.40, 1, 1.20, 1),
+  (0.11, -0.70, -1.32, 1, 1.22, 1), (0.10, -0.55, -1.25, 1, 1.24, 1), (0.08, -0.38, -1.17, 1, 1.24, 1),
+  (0.08, -0.30, -0.43, 1, 1.24, 1), (0.07, -0.22, -0.37, 1, 1.24, 1), (0.07, -0.15, -0.32, 1, 1.24, 1),
+  (0.07, -0.13, -0.27, 1, 1.24, 1),
+)
+
+
+def replay_logged(rows):
+  # open loop: the logged car keeps slowing as it did (StarPilot's own stop from the logged frames on), the law sees each frame; the
+  # car's standstill flag comes at about STANDSTILL_SPEED of wheel speed
+  law = SmoothStops(DT_MDL, ACTION_T)
+  frames_out = []
+  for v, a_ego, plan, stopping, target, model in rows:
+    result, bit = step(law, plan, v, stopping=bool(stopping), a_ego=a_ego, standstill=v < STANDSTILL_SPEED, model=bool(model),
+                       committed=True, stop_target=target, going=False)
+    asked = min(plan, law.ramp_request) if law.ramp_request is not None else plan
+    frames_out.append(NS(v=v, plan=plan, asked=asked, out=result, bit=bit, landing=law.landing, exit=law.exit_reason, urgent=law.urgent))
+  return frames_out
+
+
+class TestLoggedStops:
+  def test_0d_4806_an_enhanced_stops_line_read_short_is_kept_and_eased(self):
+    # round 7 handed this stop back as 'overrun' at 4.05 m/s, publishing the bit there, and LongControl's -2.0 ramp ran to rest
+    frames_out = replay_logged(LOGGED_4806)
+    first = next(i for i, f in enumerate(frames_out) if f.landing)
+    assert frames_out[first].v > 5.0
+    assert all(f.landing and not f.exit for f in frames_out[first:]), [(f.v, f.exit) for f in frames_out if f.exit]
+    assert next(f for f in frames_out if f.v == 4.05).bit is False
+    # never more braking than StarPilot asks, eased well before the wheel stop, the kiss at walking pace, the bit at the wheel stop
+    assert all(f.out >= f.asked - 1e-9 for f in frames_out)
+    assert any(f.out > f.asked + 0.5 for f in frames_out if f.v >= 2.0)
+    assert all(f.out >= -0.45 for f in frames_out if f.v <= 0.6 and not f.bit)
+    assert all(not f.bit for f in frames_out if f.v > CRAWL_BIT_SPEED + 0.06)
+
+  def test_0d_1235_a_hard_model_stop_held_to_rest_fades_to_the_kiss(self):
+    # the model asked 2.37 m/s^2 down to 1 m/s; round 7 passed it unchanged to rest
+    frames_out = replay_logged(LOGGED_1235)
+    landed = [f for f in frames_out if f.landing]
+    assert landed and all(not f.exit for f in frames_out) and any(f.urgent for f in landed)
+    assert all(f.out >= f.asked - 1e-9 for f in frames_out)
+    # at speed the hard braking passes as asked; it fades before the wheels stop
+    assert all(f.out == f.asked for f in frames_out if f.v >= 3.5)
+    # (at rest, under the bit, the plan passes and LongControl holds the car)
+    assert all(f.out >= -1.2 for f in frames_out if f.v <= 1.0 and not f.bit)
+    assert all(f.out >= -0.2 for f in frames_out if f.v <= 0.2 and not f.bit)
+    assert all(not f.bit for f in frames_out if f.v > CRAWL_BIT_SPEED + 0.06)
+
+
+class TestDiagnostics:
+  @staticmethod
+  def changes(rows):
+    with patch('openpilot.starpilot.longitudinal.smooth_stops.cloudlog.event') as event:
+      replay_logged(rows)
+    assert all(call.args == ('smooth_stops',) for call in event.call_args_list)
+    return [call.kwargs for call in event.call_args_list]
+
+  def test_a_landing_logs_only_its_changes(self):
+    changes = self.changes(LOGGED_1235)
+    assert [c['change'] for c in changes] == ['start', 'urgent_on', 'urgent_off', 'bit']
+    for c in changes:
+      # every value reads back from the rlog's logMessage as plain JSON
+      assert json.loads(json.dumps(c, allow_nan=False)) == c
+      assert {'v', 'plan', 'target_m', 'anchor_m', 'travelled', 'overrun'} <= set(c)
+    assert [c['change'] for c in self.changes(LOGGED_4806)] == ['start', 'bit']
+
+  def test_a_hand_back_logs_its_reason(self):
+    with patch('openpilot.starpilot.longitudinal.smooth_stops.cloudlog.event') as event:
+      law = landing(1.0, -0.6)
+      step(law, 0.8, 0.6)
+    assert [(c.kwargs['change'], c.kwargs.get('reason')) for c in event.call_args_list] == [('start', None), ('exit', 'launch')]
+
+  def test_nothing_is_logged_with_the_toggle_off(self):
+    law = SmoothStops(DT_MDL, ACTION_T)
+    sm = {'carState': NS(vEgo=1.0, aEgo=-0.5, standstill=False), 'radarState': NS(leadOne=NS(present=False), leadTwo=NS(present=False))}
+    with patch('openpilot.starpilot.longitudinal.smooth_stops.cloudlog.event') as event:
+      for _ in range(frames(2.0)):
+        law.sample(sm, target=-1.0, stopping=True, enabled=False, active=True, plan_speeds=[1.0, 0.0], target_source=SOURCE.lead0,
+                   forcing=True, stop_target=1.0)
+    assert not event.called
+
+  def test_the_event_reaches_the_log_as_json(self):
+    # the line logmessaged writes into the rlog's logMessage
+    lines = []
+
+    class Capture(logging.Handler):
+      def emit(self, record):
+        lines.append(self.format(record))
+
+    handler = Capture()
+    handler.setFormatter(SwagFormatter(cloudlog))
+    cloudlog.addHandler(handler)
+    try:
+      replay_logged(LOGGED_4806)
+    finally:
+      cloudlog.removeHandler(handler)
+    events = [json.loads(line)['msg'] for line in lines]
+    events = [e for e in events if isinstance(e, dict) and e.get('event') == 'smooth_stops']
+    assert [e['change'] for e in events] == ['start', 'bit'] and events[0]['committed'] is True
 
 
 def test_output_never_goes_below_accel_min():

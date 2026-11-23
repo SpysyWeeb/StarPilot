@@ -361,6 +361,65 @@ def test_a_late_enhanced_stops_commit_at_speed_is_braked_in_full(v0, line):
   assert on_past <= off_past + 0.1 and on_peak >= off_peak - 0.1, (off_past, on_past, off_peak, on_peak)
 
 
+def short_enhanced_stop(smooth, short, *, v0=5.6, stop_at=12.0, shortfall=0.0, creep=0.0, seconds=14.0):
+  # the road's 0d 48:06 in Experimental mode: the model asks a gentle stop 1 m short of stop_at, while Enhanced Stops' countdown reads
+  # its line `short` metres nearer and so raises its stop bit at about 5 m/s
+  drive = Drive(v0, smooth=smooth, shortfall=shortfall, creep=creep, a0=-1.3)
+  exits = []
+  for _ in range(round(seconds / DT_MDL)):
+    room = max(stop_at - drive.x - 1.0, 0.05)
+    e2e = -min(drive.v ** 2 / (2.0 * room), 4.0) if drive.v > 0.0 else -0.3
+    target = max(0.0, stop_at - drive.x - short)
+    ceiling = math.sqrt(2.0 * 0.65 * max(target - 6.0, 0.0))
+    plan = StopPlan(BASE_NS + drive.frame * 50_000_000 - 10_000_000, None, None, True, ceiling <= 0.5, target, 0.0, 0.32, False,
+                    target_m=target)
+    drive.step(experimental=True, model_stop=drive.v < 0.3, e2e=e2e, force_stop=plan)
+    owner = drive.planner.smooth_stops
+    if owner is not None and owner.exit_reason and (not exits or exits[-1][0] != owner.exit_reason):
+      exits.append((owner.exit_reason, drive.v))
+  return drive, exits
+
+
+@pytest.mark.parametrize('short', [2.0, 3.0])
+@pytest.mark.parametrize('shortfall,creep', [(0.0, 0.0), (0.2, 0.3)])
+def test_an_enhanced_stops_line_read_short_is_not_handed_back(short, shortfall, creep):
+  # round 7 handed this stop back as soon as the short line left no room ('overrun', at about 4 m/s), and LongControl's ramp to
+  # -2.0 then ran to rest. Now StarPilot's own stop plus the leeway bounds it, the landing keeps it and fades to the kiss
+  (off, _), (on, exits) = (short_enhanced_stop(smooth, short, shortfall=shortfall, creep=creep) for smooth in (False, True))
+  bit_v = next(row[2] for row in off.trace if row[5])
+  assert 4.3 <= bit_v <= 5.4, bit_v
+  # kept to walking pace (a creeping car the kiss cannot hold may still be handed back as it crawls)
+  assert all(v < 0.5 for _, v in exits), exits
+  assert math.isfinite(on.rest[0]) and on.rest[1] <= off.rest[1] + LEEWAY + 0.05, (off.rest, on.rest)
+  # never past what the model stops for (it aims 1 m short of it)
+  assert on.rest[1] < 12.0
+  assert on.peaks()[0] <= off.peaks()[0] + PEAK_DECEL and on.stop_bit_pulses == 0
+  assert at_stop(on) < at_stop(off) - 0.5, (at_stop(on), at_stop(off))
+  first_bit = next(row for row in on.trace if row[5])
+  assert first_bit[2] <= 0.11 or shortfall > 0.0, first_bit
+
+
+def model_held_hard(smooth, *, v0=6.0, shortfall=0.0, creep=0.0, seconds=10.0):
+  # the road's 0d 12:35: the model asks 2.4 m/s^2 down to 1 m/s and eases only as the wheels stop (to 1.3 m/s^2 at rest)
+  drive = Drive(v0, smooth=smooth, shortfall=shortfall, creep=creep, a0=-1.8)
+  for _ in range(round(seconds / DT_MDL)):
+    e2e = -2.4 if drive.v > 1.0 else -(1.3 + 1.1 * drive.v) if drive.v > 0.0 else -0.3
+    drive.step(experimental=True, model_stop=drive.v < 0.3, e2e=e2e)
+  return drive
+
+
+@pytest.mark.parametrize('shortfall,creep', PLANTS)
+def test_a_model_stop_held_hard_to_rest_still_fades_to_the_kiss(shortfall, creep):
+  # round 7 passed an urgent demand unchanged to rest; now its last part fades at URGENT_FADE_JERK, costing well under the leeway
+  off, on = (model_held_hard(smooth, shortfall=shortfall, creep=creep) for smooth in (False, True))
+  assert math.isfinite(on.rest[0]) and on.rest[1] <= off.rest[1] + LEEWAY, (off.rest, on.rest)
+  assert on.peaks()[0] <= off.peaks()[0] + PEAK_DECEL and on.stop_bit_pulses == 0
+  assert at_stop(on) < at_stop(off) - 0.5, (at_stop(on), at_stop(off))
+  # at speed the hard braking passes as asked
+  fast = [(a, b) for a, b in zip(off.trace, on.trace, strict=False) if a[2] > 3.5]
+  assert fast and all(abs(a[4] - b[4]) < 1e-6 for a, b in fast)
+
+
 @pytest.mark.parametrize('event', ['force_decel', 'fcw'])
 def test_forcedecel_or_fcw_mid_landing_hands_the_stop_back_at_once(event):
   drive = Drive(2.0, smooth=True)
