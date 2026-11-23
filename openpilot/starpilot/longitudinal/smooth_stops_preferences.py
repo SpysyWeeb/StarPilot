@@ -2,10 +2,10 @@
 from openpilot.starpilot.saved_source import read_saved
 
 KEY = 'SmoothStops'
-DESCRIPTION = ("Eases off the brakes in the last few feet of a stop behind another car, so your car settles to a halt instead of " +
-               "lurching. Stops usually take about a second longer and end about a foot closer to the car ahead (up to 2.5 " +
-               "seconds and 3 feet), and if that car pulls away just as yours stops, yours can take half a second longer to " +
-               "follow. Gas Hyundai, Kia and Genesis vehicles with the classic SCC radar.")
+DESCRIPTION = ("Eases off the brakes through the last few feet of every stop so your car settles to a halt instead of lurching. " +
+               "Stops can end a little further forward (in testing a few inches on average, at most about 2.5 feet) and take a " +
+               "moment longer. Enhanced Stops' Stop Distance Adjustment pulls stops at lights and signs back. Gas Hyundai, Kia " +
+               "and Genesis vehicles with the classic SCC radar.")
 
 
 def supported(cp) -> bool:
