@@ -462,6 +462,39 @@ def test_a_blip_of_starpilots_stop_bit_does_not_end_the_stop_early(blip_speed, l
   assert on_gap <= off_gap + 0.5 and on_peak <= off_peak + PEAK_DECEL, runs
 
 
+def late_object_under_a_far_line(smooth, v0, trigger_x, distance, shortfall, creep, committed=True, seconds=14.0):
+  # Experimental, optionally with Enhanced Stops committed to a line read right 30 m on; past trigger_x something only the model
+  # sees appears distance metres ahead and the model aims 1 m short of it
+  drive = Drive(v0, smooth=smooth, shortfall=shortfall, creep=creep, a0=-0.5)
+  line, x_obj = 30.0, None
+  for _ in range(round(seconds / DT_MDL)):
+    if x_obj is None and drive.x >= trigger_x:
+      x_obj = drive.x + distance
+    room = max((x_obj if x_obj is not None else line) - 1.0 - drive.x, 0.05)
+    e2e = -min(drive.v ** 2 / (2.0 * room), 4.0) if drive.v > 0.0 else -0.3
+    plan = None
+    if committed:
+      target = max(0.0, line - drive.x)
+      ceiling = math.sqrt(2.0 * 0.65 * max(target - 6.0, 0.0))
+      plan = StopPlan(BASE_NS + drive.frame * 50_000_000 - 10_000_000, None, None, True, ceiling <= 0.5, target, 0.0, 0.32, False,
+                      target_m=target)
+    drive.step(experimental=True, model_stop=drive.v < 0.3, e2e=e2e, force_stop=plan)
+  return drive
+
+
+@pytest.mark.parametrize('v0,trigger_x,distance', [(3.4, 1.0, 4.0), (3.4, 1.0, 3.2), (4.5, 2.0, 5.0), (3.0, 0.5, 2.8)])
+@pytest.mark.parametrize('shortfall,creep', PLANTS)
+def test_a_late_model_stop_under_a_far_enhanced_stops_line_is_braked_as_without_it(v0, trigger_x, distance, shortfall, creep):
+  # the far line bounds the rest point, so the model's own point bounds an urgent fade: a commitment to a line further on never
+  # lets the car roll further toward what the model stops for than the same stop without it, and the soft end costs at most the
+  # fade's own few centimetres against the stop without Smooth Stops
+  off = late_object_under_a_far_line(False, v0, trigger_x, distance, shortfall, creep)
+  free = late_object_under_a_far_line(True, v0, trigger_x, distance, shortfall, creep, committed=False)
+  on = late_object_under_a_far_line(True, v0, trigger_x, distance, shortfall, creep)
+  assert on.rest[1] <= free.rest[1] + 0.05 and on.rest[1] <= off.rest[1] + 0.25, (off.rest[1], free.rest[1], on.rest[1])
+  assert on.stop_bit_pulses == 0
+
+
 @pytest.mark.parametrize('scene', ['force_decel', 'fcw'])
 def test_urgent_owners_keep_their_own_stop(scene):
   # forceDecel and FCW bypass Smooth Stops: the drive is the same frame for frame

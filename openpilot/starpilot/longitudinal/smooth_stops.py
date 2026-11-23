@@ -270,6 +270,18 @@ class SmoothStops:
       v += a * h
       t += h
     return x
+  def model_requirement(self, v_ego, a_ego=None):
+    # the braking that keeps the car short of the model's own stop point (model_anchor already sits LEEWAY short of it), counted
+    # with the speed now standing in for the speed after the delay, as for a brake that delivers less than asked. None needed
+    # before the model has set the plan; with no room left (inf) the plan passes as it is
+    if not math.isfinite(self.model_anchor):
+      return 0.0
+    settled, self.settled = self.settled, False
+    try:
+      return self.overrun_requirement(v_ego, self.model_anchor - self.travelled, a_ego)
+    finally:
+      self.settled = settled
+
   def overrun_requirement(self, v_ego, plan_stop, a_ego=None):
     # the braking that brings the car to rest within LEEWAY of the plan's own stop point once the requests already on their way
     # have played out: none while riding the corridor rests inside it, else what sheds the extra speed before the kiss, or, with
@@ -446,7 +458,10 @@ class SmoothStops:
         # an urgent demand passes as StarPilot itself would send it (its plan, or its stopping state, which keeps a request already
         # below stopAccel, see starpilot_request) until the car's braking would have to fade to reach the kiss at rest; what a lead
         # or the bound on the rest point needs still passes
-        output = max(plan, -max(urgent_request(v_ego, self.action_t), self.required_decel, self.overrun_decel))
+        # Under an Enhanced Stops commitment the rest point is bounded by its line, which can lie well past something the model
+        # stops for late, so there the model's own point bounds the fade too, with no leeway and counted as the car slows now
+        model_need = self.model_requirement(v_ego, a_ego) if self.committed and rolling else 0.0
+        output = max(plan, -max(urgent_request(v_ego, self.action_t), self.required_decel, self.overrun_decel, model_need))
       else:
         output = max(plan, -max(self.bound(v_ego), self.required_decel, self.overrun_decel))
         if self.urgent_release:
