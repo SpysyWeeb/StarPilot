@@ -31,8 +31,10 @@ def frames(seconds):
 
 
 def step(law, a_target, v_ego, leads=NO_LEADS, intent=True, stopping=False, a_ego=None, standstill=False, model=False,
-         committed=False):
-  return law.update(a_target, v_ego, leads, intent, stopping, a_ego=a_ego, standstill=standstill, model=model, committed=committed)
+         committed=False, stop_target=None, going=None):
+  going = a_target > 0.0 if going is None else going
+  return law.update(a_target, v_ego, leads, intent, stopping, a_ego=a_ego, standstill=standstill, model=model, committed=committed,
+                    stop_target=stop_target, going=going)
 
 
 def out(law, a_target, v_ego, leads=NO_LEADS, intent=True, a_ego=None):
@@ -93,17 +95,25 @@ class TestCorridor:
     assert out(law, -0.5, 1.5) == -0.5
     assert out(law, -1.1, 1.5) == -law.bound(1.5)
 
-  def test_the_floor_keeps_a_landing_braking_and_fades_above_creep_speed(self):
+  def test_a_landing_only_eases_unless_the_car_is_not_delivering(self):
     law = landing()
-    assert out(law, -0.05, 0.8) == -law.floor(0.8)
-    # above the fade the floor is gone: an easing plan in a queue is not dragged to a stop
-    assert out(law, -0.05, 2.0) == -0.05
+    assert out(law, -0.05, 0.8, a_ego=-0.05) == -0.05 and out(law, -0.05, 2.0) == -0.05
+    rng = np.random.default_rng(1)
+    for v_ego, a_target in zip(rng.uniform(0.2, LANDING_SPEED - 0.01, 500), rng.uniform(-1.9, -0.2, 500), strict=True):
+      law = landing(max(v_ego, 0.5), -1.0)
+      assert step(law, a_target, v_ego, a_ego=a_target)[0] >= a_target - 1e-9
+    # a car still not slowing under a plan that asks it to (creep, a weak brake) is pressed beyond the plan
+    law = landing(0.8, -0.3)
+    for _ in range(frames(0.25)):
+      result, _ = step(law, -0.3, 0.8, a_ego=0.1)
+    assert result < -0.3 and law.integral > 0.0
 
   def test_both_edges_meet_at_the_kiss_by_walking_pace_and_the_plan_passes_at_rest(self):
     law = landing()
     for v_ego in (KISS_SPEED, 0.2, 0.12):
-      for a_target in (-0.3, -0.02):
-        assert math.isclose(out(law, a_target, v_ego), -KISS_DECEL, abs_tol=1e-9)
+      assert math.isclose(out(law, -0.3, v_ego), -KISS_DECEL, abs_tol=1e-9)
+      # a plan already gentler than the kiss passes as it is
+      assert out(law, -0.02, v_ego) == -0.02
     # the wheels stop under the kiss; once the stop bit is up at rest, LongControl's stopping state holds the car and the plan
     # passes as it is
     assert step(law, -0.3, STANDSTILL_SPEED, stopping=True) == (-KISS_DECEL, True)
@@ -239,14 +249,33 @@ class TestLeeway:
     assert law.overrun_requirement(1.5, 0.3) >= 1.5 * 1.5 / (2.0 * (0.3 + LEEWAY - 1.5 * ACTION_T)) - 1e-9
     assert law.overrun_requirement(1.5, -LEEWAY) == math.inf
 
-  def test_starpilots_own_stop_point_is_fixed_to_the_road(self):
+  def test_starpilots_own_stop_point_is_fixed_to_the_road_once_its_bit_has_stayed_up(self):
     law = landing(1.0, -0.6)
+    for _ in range(law.anchor_frames - 1):
+      step(law, -0.6, 0.9, stopping=True, a_ego=-0.6)
+      assert law.ramp_anchor is None and law.ramp_request is None
     step(law, -0.6, 0.9, stopping=True, a_ego=-0.6)
     anchor = law.ramp_anchor
-    assert 0.0 < anchor < 2.0
+    assert anchor is not None and 0.0 < anchor - law.travelled < 2.0 and law.ramp_request < -0.6
     for _ in range(frames(1.0)):
       step(law, -0.6, 0.5, stopping=True, a_ego=-0.6)
     assert law.ramp_anchor == anchor and law.travelled > 0.5
+    # the bit dropping clears it; a blip of the bit never sets it
+    step(law, -0.6, 0.5, stopping=False, a_ego=-0.6)
+    assert law.ramp_anchor is None and law.ramp_request is None
+    for _ in range(law.anchor_frames - 1):
+      step(law, -0.6, 0.5, stopping=True, a_ego=-0.6)
+    step(law, -0.6, 0.5, stopping=False, a_ego=-0.6)
+    assert law.ramp_anchor is None and law.landing
+
+  def test_an_enhanced_stops_commitment_uses_its_own_stop_point(self):
+    law = SmoothStops(DT_MDL, ACTION_T)
+    step(law, -0.4, 2.0, committed=True, stop_target=6.0)
+    assert law.landing and law.plan_stop(2.0, -0.4, False) == 6.0 - LEEWAY
+    # where the soft tail no longer fits before that point the landing eases less, never more braking than StarPilot's own
+    for _ in range(law.anchor_frames + 2):
+      result, bit = step(law, -0.4, 2.0, stopping=True, committed=True, stop_target=1.5, a_ego=-0.4)
+    assert bit is False and law.ramp_request - 1e-9 <= result <= -0.4
 
 
 class TestStopBit:
@@ -273,6 +302,31 @@ class TestStopBit:
                                       (0.0, 0.0, False), (0.0, 0.3, False), (0.05, 0.6, False)):
       bits.append(step(law, a_target, v_ego, stopping=stopping)[1])
     assert bits == [False, False, True, True, True, False, False]
+
+  def test_a_launch_hand_back_does_not_publish_the_held_bit_while_the_plan_moves(self):
+    law = landing(0.4, -0.4)
+    assert step(law, -0.4, 0.3, stopping=True)[1] is False
+    bits = [step(law, a_target, 0.25, stopping=True)[1] for a_target in (0.3, 0.4, 0.5)]
+    assert bits == [False, False, False] and law.exit_reason == 'launch'
+    # the plan no longer asking to move with StarPilot's bit still up: its bit is published, and stays
+    assert step(law, -0.05, 0.25, stopping=True)[1] is True and step(law, 0.1, 0.25, stopping=True)[1] is True
+    # a plan barely positive, not going, with StarPilot's bit up is StarPilot's stop: the held bit is published at the hand-back
+    law = landing(0.4, -0.4)
+    step(law, -0.4, 0.3, stopping=True)
+    assert step(law, 0.05, 0.25, stopping=True, going=False) == (0.05, True) and law.exit_reason == 'launch'
+
+  def test_a_published_bit_is_never_withdrawn_across_a_reset(self):
+    # forceDecel, FCW, the toggle or longActive dropping for a frame resets the landing; StarPilot's bit published meanwhile stays
+    law = SmoothStops(DT_MDL, ACTION_T)
+    sm = {'carState': NS(vEgo=0.8, aEgo=-0.5, standstill=False),
+          'radarState': NS(leadOne=NS(present=False), leadTwo=NS(present=False))}
+    kwargs = {'enabled': True, 'plan_speeds': [1.0, 0.5, 0.0], 'target_source': SOURCE.lead0, 'forcing': False}
+    assert law.sample(sm, target=-0.8, stopping=False, active=True, **kwargs) == (pytest.approx(-law.bound(0.8)), False)
+    assert law.landing
+    assert law.sample(sm, target=-0.8, stopping=True, active=False, **kwargs) == (-0.8, True) and not law.landing
+    for _ in range(3):
+      assert law.sample(sm, target=-0.8, stopping=True, active=True, **kwargs) == (-0.8, True)
+    assert not law.landing
 
   def test_outside_a_landing_the_target_and_bit_are_starpilots(self):
     law = SmoothStops(DT_MDL, ACTION_T)
@@ -307,13 +361,13 @@ class TestLead:
 class TestAntiStall:
   def test_a_car_not_slowing_presses_both_edges(self):
     law = landing(0.3, -0.3)
-    kiss = [out(law, -0.3, 0.3, a_ego=0.1) for _ in range(frames(1.0))]
+    kiss = [out(law, -0.3, 0.3, a_ego=0.1) for _ in range(frames(0.25))]
     assert kiss[0] < -KISS_DECEL
     assert all(b < a for a, b in zip(kiss, kiss[1:], strict=False))
 
   def test_the_press_drains_as_the_car_slows_again(self):
     law = landing(0.3, -0.3)
-    for _ in range(frames(1.0)):
+    for _ in range(frames(0.25)):
       pressed = out(law, -0.3, 0.3, a_ego=0.1)
     drained = [out(law, -0.3, 0.3, a_ego=-0.6) for _ in range(frames(2.0))]
     assert drained[0] > pressed
@@ -323,7 +377,7 @@ class TestAntiStall:
   def test_nothing_is_pressed_at_rest_or_where_the_floor_has_faded(self):
     for v_ego in (0.0, 0.05, STANDSTILL_SPEED):
       law = landing(0.3, -0.3)
-      for _ in range(frames(1.0)):
+      for _ in range(frames(0.25)):
         out(law, -0.3, 0.3, a_ego=0.1)
       assert law.integral > 0.1
       assert out(law, -0.3, v_ego, a_ego=0.2) == -KISS_DECEL
@@ -374,8 +428,9 @@ class TestPlannerHook:
     # Enhanced Stops hands its last metres to StarPilot's stop bit: the landing takes them from the frame it rises, never asks to
     # accelerate while committed, and keeps the stop within the leeway of where StarPilot's own ramp would have ended it
     law = SmoothStops(DT_MDL, ACTION_T)
-    target, bit = self.sample(law, self.sm(v_ego=1.2, lead=None), 0.3, source=SOURCE.cruise, end=2.0, stopping=True, forcing=True)
-    assert law.landing and bit is False and target <= 0.0 and law.ramp_anchor is not None
+    target, bit = law.sample(self.sm(v_ego=1.2, lead=None), target=0.3, stopping=True, enabled=True, active=True, plan_speeds=[1.0, 2.0],
+                             target_source=SOURCE.cruise, forcing=True, stop_target=5.0)
+    assert law.landing and bit is False and target <= 0.0 and law.stop_target == 5.0
   def test_turning_it_off_mid_landing_hands_the_plan_back(self):
     law = SmoothStops(DT_MDL, ACTION_T)
     assert self.sample(law, self.sm(), -0.9)[1] is False and law.landing
@@ -437,6 +492,8 @@ def test_saved_preference_is_read_about_once_a_second(tmp_path):
   (CAR.HYUNDAI_KONA_EV, False), (CAR.HYUNDAI_SONATA_HYBRID, False), (CAR.KIA_NIRO_PHEV_2022, False), (CAR.HYUNDAI_NEXO_1ST_GEN, False),
   (CAR.HYUNDAI_IONIQ_5, False), (CAR.KIA_EV9, False), (CAR.GENESIS_G90, False), (CAR.HYUNDAI_PALISADE_2023, False),
   (CAR.KIA_RAY_EV, False), (CAR.HYUNDAI_KONA_NON_SCC, False), (CAR.GENESIS_G70, False),
+  # camera SCC: the SCC messages come from the camera's own controller, not the radar's this was measured on
+  (CAR.HYUNDAI_ELANTRA_2024, False),
 ])
 def test_supported_vehicles(fingerprint, expected):
   cp = CarInterface.get_non_essential_params(fingerprint)

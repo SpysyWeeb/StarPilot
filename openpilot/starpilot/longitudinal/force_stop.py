@@ -100,6 +100,8 @@ class StopPlan:
   takeoff_light: bool = False
   resume_override: bool = False
   episode_ns: int = 0
+  # m ahead, while committed: where this stop means to end, the tracked line moved by the offset and bias (Smooth Stops' limit)
+  target_m: float | None = None
 
 
 class ForceStop:
@@ -405,5 +407,6 @@ class ForceStop:
     return StopPlan(now, ceiling, obstacle, self.forcing, should_stop,
                     max(0.0,self.distance) if self.forcing else 0.0, approach,
                     tune.jerk_scale if self.forcing or approach > 0 else 1.0, bool(held and self.forcing and not overridden),
-                    resume_override=now < self.resume_until_ns, episode_ns=self.episode_ns)
+                    resume_override=now < self.resume_until_ns, episode_ns=self.episode_ns,
+                    target_m=max(0.0, self.distance + offset + tune.distance_bias_m) if self.forcing else None)
 
