@@ -309,6 +309,33 @@ def test_a_lead_pulling_away_does_not_take_the_car_through_the_models_stop():
   assert off_bit and on_bit and on_v <= off_v + 0.02 and on_pulses == 0, runs
 
 
+@pytest.mark.parametrize('bit_speed', [3.5, 2.5])
+@pytest.mark.parametrize('shortfall,creep', [(0.0, 0.0), (0.2, 0.3)])
+def test_an_enhanced_stops_bit_raised_at_speed_is_landed(bit_speed, shortfall, creep):
+  # the road's harsh case: Enhanced Stops commits and raises the stop bit at 3.5 m/s, which hands the last metres to LongControl's
+  # ramp to -2.0. With Smooth Stops the landing takes them: the bit waits for the wheel stop, braking never peaks harder, and the
+  # car never rests past the line further than StarPilot's own stop does
+  runs = []
+  for smooth in (False, True):
+    drive = Drive(bit_speed + 0.6, smooth=smooth, shortfall=shortfall, creep=creep)
+    bit_at = None
+    for _ in range(round(25.0 / DT_MDL)):
+      left = 20.0 - drive.x
+      if bit_at is None and drive.v <= bit_speed and drive.frame > 5:
+        bit_at = drive.x
+      plan = StopPlan(BASE_NS + drive.frame * 50_000_000 - 10_000_000, 0.0 if bit_at is not None else None, max(0.0, left * 0.93),
+                      True, bit_at is not None, max(0.0, left), 0.0, 0.32, False, target_m=max(0.0, left))
+      drive.step(force_stop=plan, v_cruise=bit_speed + 0.6)
+    runs.append(drive)
+  off, on = runs
+  assert on.peaks()[0] <= off.peaks()[0] + PEAK_DECEL and on.stop_bit_pulses == 0
+  assert on.rest[1] <= max(20.0, off.rest[1]) + 0.1
+  if shortfall == 0.0:
+    first_bit = next(row for row in on.trace if row[5])
+    assert first_bit[2] <= 0.11 and at_stop(on) < at_stop(off) - 0.5, (first_bit, at_stop(on), at_stop(off))
+  # a brake too weak to stop short of the line hands the stop back to StarPilot's own ramp: no softer, never harder
+
+
 @pytest.mark.parametrize('event', ['force_decel', 'fcw'])
 def test_forcedecel_or_fcw_mid_landing_hands_the_stop_back_at_once(event):
   drive = Drive(2.0, smooth=True)

@@ -54,8 +54,10 @@ LEEWAY = 0.5                 # m, how much further on than StarPilot's own stop 
 LEAD_STANDING_GAP = 2.0
 LEAD_ABSENCE_TIME = 0.35     # s a lead's requirement is kept after its reading drops out
 STANDSTILL_SPEED = 0.10      # m/s, about the car's standstill flag (0.104 m/s of wheel speed on Hyundai)
-URGENT_DECEL = 2.0           # m/s^2, a plan asking this much below LANDING_SPEED ...
-URGENT_TIME = 0.1            # s ... for this long is an emergency, not a landing
+URGENT_DECEL = 2.0           # m/s^2, a plan asking this much ...
+URGENT_TIME = 0.1            # s ... for this long passes unchanged for as long as it asks; the landing then takes the tail back
+CRAWL_BIT_SPEED = 0.05       # m/s, below walking pace the stop bit waits for this (or the standstill flag) ...
+CRAWL_TIME = 1.0             # s ... or for the car to have crawled under STANDSTILL_SPEED this long
 ANCHOR_TIME = 0.15           # s StarPilot's own stop bit must stay up before its stop counts: a blip of the bit is not a stop
 # A far backstop for a car that is neither slowing nor running out of room; the leeway, not this, bounds a stop
 HOLD_DISTANCE = 10.0         # m, the most the car travels with StarPilot's own stop bit held back ...
@@ -166,6 +168,8 @@ class SmoothStops:
     self.committed = False
     self.stop_target = None
     self.going = self.stopping = False
+    self.urgent = False
+    self.slow_time = 0.0
     self.launching = False
     self.stop_bit = False
     self.bit_frames = 0
@@ -340,6 +344,9 @@ class SmoothStops:
         self.held_distance += v_ego * self.dt
         self.held_time += self.dt
       self._urgent = self._urgent + 1 if a_target < -URGENT_DECEL else 0
+      # a demand of URGENT_DECEL or more passes unchanged while it lasts; the landing takes the tail back once it eases
+      self.urgent = self._urgent >= self.urgent_frames or (self.urgent and a_target < -URGENT_DECEL)
+      self.slow_time = self.slow_time + self.dt if v_ego <= STANDSTILL_SPEED else 0.0
       self.overrun_decel = self.overrun_requirement(v_ego, self.plan_stop(v_ego, a_target, model), a_ego) if rolling else 0.0
       self.exit_reason = 'go' if not intent else self._exit_reason(a_target, v_ego)
       if self.exit_reason:
@@ -348,7 +355,7 @@ class SmoothStops:
         self.launching = self.exit_reason == 'launch' and going and rolling and not self.stop_bit
         self.landing = False
         self.handed_back = True
-    elif (not self.handed_back and not self._last_bit and (v_ego < LANDING_SPEED or committed and stopping) and intent and
+    elif (not self.handed_back and not self._last_bit and (v_ego < LANDING_SPEED or stopping) and intent and
           (a_target < -KISS_DECEL or committed and stopping)):
       self.landing = True
       self.stop_bit = False
@@ -359,6 +366,8 @@ class SmoothStops:
       self.model_anchor = math.inf
       self.bit_frames = 0
       self._urgent = 0
+      self.urgent = False
+      self.slow_time = 0.0
       plan = self.starpilot_request(v_ego, a_target, stopping, a_ego)
       self.overrun_decel = self.overrun_requirement(v_ego, self.plan_stop(v_ego, a_target, model), a_ego) if rolling else 0.0
     if not self.landing:
@@ -377,7 +386,7 @@ class SmoothStops:
       plan = min(plan, 0.0) if self.committed or stopping else plan
       press = self.integral if rolling else 0.0
       bound = max(self.bound(v_ego), self.required_decel, self.overrun_decel)
-      output = max(plan, -bound)
+      output = plan if self.urgent else max(plan, -bound)
       if press > 0.0:
         output = min(output, -(min(max(-plan, 0.0), self.floor(v_ego)) + press))
       output = max(output, ACCEL_MIN)
@@ -385,7 +394,9 @@ class SmoothStops:
       # the wheels have stopped under the kiss and the stop bit is up: LongControl's stopping state holds the car and the plan
       # passes as it is, so the car launches from rest when it would without Smooth Stops
       output = a_target
-    if rolling and not self.stop_bit:
+    # the bit waits for the wheels to have all but stopped: under CRAWL_BIT_SPEED, the standstill flag, or a crawl that has lasted
+    bit_ready = standstill or v_ego <= CRAWL_BIT_SPEED or self.slow_time >= CRAWL_TIME
+    if not bit_ready and not self.stop_bit:
       bit = False
     else:
       # rises as the wheels stop and stays up, through wheel-speed ticks at rest, until the plan asks to move
@@ -430,10 +441,8 @@ class SmoothStops:
     # StarPilot's bit (a lead creeping, the model's red light) is still StarPilot's stop, and the landing keeps easing it to rest
     if a_target > 0.0 and not self.committed and (self.going or not self.stopping):
       return 'launch'
-    if v_ego >= LANDING_SPEED and not self.committed:
+    if v_ego >= LANDING_SPEED and not self.committed and not self.stopping:
       return 'window'
-    if self._urgent >= self.urgent_frames:
-      return 'urgent'
     if self.required_decel > self.bound(v_ego):
       return 'lead'
     if self.overrun_decel == math.inf:

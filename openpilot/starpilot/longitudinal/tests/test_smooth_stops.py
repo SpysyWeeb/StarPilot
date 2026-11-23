@@ -10,7 +10,7 @@ from opendbc.car.interfaces import ACCEL_MIN
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.starpilot.longitudinal.smooth_stops import (CREEP_FADE_SPEED, CREEP_SPEED, KISS_DECEL, KISS_SPEED, LANDING_SPEED,
-                                                           LEAD_ABSENCE_TIME, LEAD_STANDING_GAP, LEEWAY, STALL_MAX,
+                                                           LEAD_ABSENCE_TIME, LEAD_STANDING_GAP, LEEWAY, STALL_MAX, CRAWL_BIT_SPEED, CRAWL_TIME,
                                                            STANDSTILL_SPEED, URGENT_DECEL, URGENT_TIME, Lead, SmoothStops,
                                                            corridor_distance, landing_bound, landing_floor, owner_for)
 from openpilot.starpilot.longitudinal.smooth_stops_preferences import KEY, SmoothStopsPreferences, supported
@@ -116,7 +116,7 @@ class TestCorridor:
       assert out(law, -0.02, v_ego) == -0.02
     # the wheels stop under the kiss; once the stop bit is up at rest, LongControl's stopping state holds the car and the plan
     # passes as it is
-    assert step(law, -0.3, STANDSTILL_SPEED, stopping=True) == (-KISS_DECEL, True)
+    assert step(law, -0.3, CRAWL_BIT_SPEED, stopping=True) == (-KISS_DECEL, True)
     for a_target in (-0.3, -0.02, 0.0):
       assert step(law, a_target, 0.0, stopping=True) == (a_target, True)
     assert law.landing
@@ -156,17 +156,14 @@ class TestHandBack:
     assert step(law, -0.4, 0.9, intent=False) == (-0.4, False)
     assert law.exit_reason == 'go'
 
-  def test_a_sudden_hard_demand_hands_back(self):
-    law = landing(1.0, -0.6)
-    urgent = -(URGENT_DECEL + 0.1)
-    for _ in range(max(round(URGENT_TIME / DT_MDL), 1) - 1):
-      assert step(law, urgent, 0.9)[0] == -law.bound(0.9) and law.landing
-    assert step(law, urgent, 0.9)[0] == urgent and law.exit_reason == 'urgent'
-    # a single hard frame between ordinary ones does not
-    law = landing(1.0, -0.6)
-    for a_target in (urgent, -0.5, urgent, -0.5):
-      step(law, a_target, 0.9)
-    assert law.landing or URGENT_TIME <= DT_MDL
+  def test_a_sudden_hard_demand_passes_unchanged_and_the_tail_is_landed(self):
+    # the road's model stops asking 2-3 m/s^2: the hard braking passes as it is for as long as it is asked, without the stop bit,
+    # and once it eases the landing takes the tail back
+    law = landing(3.0, -1.0)
+    urgent = -(URGENT_DECEL + 0.5)
+    outputs = [step(law, urgent, 2.5) for _ in range(frames(1.0))]
+    assert law.landing and all(bit is False for _, bit in outputs) and outputs[-1][0] == urgent
+    assert step(law, -0.6, 0.6)[0] > -0.6 and law.landing
   def test_a_lead_the_kiss_cannot_stop_short_of_hands_back(self):
     law = landing(0.8, -0.6)
     assert out(law, -0.6, 0.8, leads(6.0)) > -0.6 and law.landing
@@ -283,7 +280,11 @@ class TestStopBit:
     law = landing(0.6, -0.4)
     for v_ego in np.linspace(0.6, STANDSTILL_SPEED + 0.01, 10):
       assert step(law, -0.4, v_ego, stopping=False)[1] is False
-    assert step(law, -0.4, STANDSTILL_SPEED, stopping=False) == (-KISS_DECEL, True)
+    assert step(law, -0.4, CRAWL_BIT_SPEED, stopping=False) == (-KISS_DECEL, True)
+    # a car crawling under walking pace gets the bit once the crawl has lasted, not at the first wheel-speed tick under it
+    law = landing(0.6, -0.4)
+    bits = [step(law, -0.4, 0.08, stopping=True)[1] for _ in range(frames(CRAWL_TIME) + 2)]
+    assert not any(bits[:frames(CRAWL_TIME) - 1]) and bits[-1] is True
     law = landing(0.6, -0.4)
     assert step(law, -0.4, 0.3, stopping=True, standstill=True)[1] is True
 
