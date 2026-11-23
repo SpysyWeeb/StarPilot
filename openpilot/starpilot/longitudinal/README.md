@@ -215,10 +215,11 @@ light is, if the stop itself is behind a lead.
 
 Costs, from the closed-loop tests and from re-driving twelve logged lead stops on sixteen fitted variants of a Palisade's brake
 (simulated, not driven): stops behind a lead end a median 0.3 m closer to it and take a median 0.9 s longer, at worst 0.9 m and
-2.3 s on the weakest fitted brakes (0.3 m and 0.9 s on the test grid), and never closer than the 3 m standing gap allows. Braking
+2.3 s on the weakest fitted brakes (0.3 m and 0.9 s on the test grid); the least gap to the lead shrank by at most 0.8 m. Braking
 at the wheel stop falls from a median 0.79 to 0.63 m/s². When the lead pulls away while the landed car is still rolling at a
-crawl, StarPilot launches it at the MPC's jerk limit rather than from standstill, up to 0.45 s later to 2 m/s. A larger hold-back
+crawl, StarPilot launches it at the MPC's jerk limit rather than from standstill, up to 0.4 s later to 2 m/s. A larger hold-back
 budget lands softer and costs more: 1 m and 2.5 s gives 0.44 m/s² at 0.5 m median and 1.25 m worst extra roll.
+
 `smooth_stops_preferences.supported()` excludes CAN FD, hybrids, plug-ins, EVs and fuel-cell cars (regenerative braking hands over
 to the friction brake at kiss speeds), the Kona EV's legacy FCA11 path, the G90, blended and pedal longitudinal, cars without
-openpilot longitudinal, and any car with a vehicle-owned `LongitudinalExtension`. Only a 2023 Palisade has been measured.
+openpilot longitudinal, and any car with a vehicle-owned `LongitudinalExtension`. Only one car, a `HYUNDAI_PALISADE`, has been measured.
