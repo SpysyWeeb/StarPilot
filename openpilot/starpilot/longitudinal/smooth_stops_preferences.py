@@ -3,9 +3,10 @@ from openpilot.starpilot.saved_source import read_saved
 
 KEY = 'SmoothStops'
 DESCRIPTION = ("Eases off the brakes through the last few feet of every stop so your car settles to a halt instead of lurching. " +
-               "Stops can end a little further forward (in testing a few inches on average, at most about 2.5 feet) and take a " +
-               "moment longer. Enhanced Stops' Stop Distance Adjustment pulls stops at lights and signs back. Gas Hyundai, Kia " +
-               "and Genesis vehicles with the classic SCC radar.")
+               "In simulation, stops behind a car ended about 5 inches further forward on average (at most about 2.5 feet) and " +
+               "took about half a second longer (at most about 2.5 seconds); stops at lights and signs can end up to about 7 feet " +
+               "further forward, never past Enhanced Stops' own stopping point. Extra stopped-lead distance and Enhanced Stops' " +
+               "Stop Distance Adjustment pull stops back. Gas Hyundai, Kia and Genesis vehicles with radar SCC.")
 
 
 def supported(cp) -> bool:
@@ -13,13 +14,14 @@ def supported(cp) -> bool:
   request: the kind of car the corridor was measured on.
 
   CAN FD cars, hybrids, plug-ins, EVs and fuel cells (regenerative braking hands over to the friction brake at kiss speeds), the
-  Kona EV's legacy FCA11 encoding, the G90's hold shaping, blended and pedal longitudinal, cars without openpilot longitudinal,
-  and any car with a vehicle-owned LongControl policy (stopping rate, stopping or start policy) are left alone.
+  Kona EV's legacy FCA11 encoding, camera-SCC cars (the camera, not a radar, runs SCC), the G90's hold shaping, blended and pedal
+  longitudinal, cars without openpilot longitudinal, and any car with a vehicle-owned LongControl policy (stopping rate, stopping
+  or start policy) are left alone.
   """
   try:
     from opendbc.car.hyundai.values import CAR, HyundaiFlags, is_blended
     excluded = (HyundaiFlags.CANFD | HyundaiFlags.NON_SCC | HyundaiFlags.LEGACY | HyundaiFlags.UNSUPPORTED_LONGITUDINAL |
-                HyundaiFlags.HYBRID | HyundaiFlags.EV | HyundaiFlags.FCEV)
+                HyundaiFlags.HYBRID | HyundaiFlags.EV | HyundaiFlags.FCEV | HyundaiFlags.CAMERA_SCC)
     if (cp.brand != 'hyundai' or cp.carFingerprint not in CAR.__members__ or cp.passive or cp.dashcamOnly or cp.notCar or
         cp.flags & excluded or cp.carFingerprint == CAR.GENESIS_G90 or is_blended(cp)):
       return False
