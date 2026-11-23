@@ -204,7 +204,8 @@ ever eases what StarPilot itself asks: its plan, or, once StarPilot's own stop b
 LongControl would be running. The eased request stays inside a corridor that falls with speed to a 0.15 m/s² kiss at walking pace,
 requested one actuator delay ahead (the planner's effective delay, including a developer override).
 More braking than StarPilot asks comes only from an anti-stall press while the car delivers less than asked (creep, a weak brake).
-StarPilot's stop bit is held back until the wheels have nearly stopped (0.10 m/s or the standstill flag), so the stopping ramp and
+StarPilot's stop bit, including one Enhanced Stops or the model raises at speed, is held back until the wheels have all but
+stopped (0.05 m/s, the standstill flag, or a crawl under 0.10 m/s that has lasted 1 s), so the stopping ramp and
 the hold start at rest; the bit then stays up until the plan asks to move.
 
 Where the car rests stays StarPilot's, within a bound. Enhanced Stops, committed or approaching a light it tracks, does not rest past
@@ -213,8 +214,8 @@ stop back and the car rests at most a few centimetres further past it than today
 stops end 1.5-3.4 m short of that line, so a landed one can end that much nearer it. Any other stop rests at most 0.5 m further on than where StarPilot's stopping ramp would have ended
 it, counted from the moment StarPilot's bit has stayed up 0.15 s; easing before that moment is not bounded, so the simulated worst
 case is 0.73 m. It never rests past the model's own stop point, and a radar lead always keeps 2 m after the actuator delay. Where the
-soft end no longer fits, the landing eases less. A landing hands the stop back when the plan no longer means to stop, asks 2 m/s²
-or more, when a lead is closer than the kiss can stop short of, when no room is left, or when the car keeps not slowing; the plan's
+soft end no longer fits, the landing eases less. A demand of 2 m/s² or more passes unchanged while it lasts, and the landing takes the tail back once it eases, within the
+model's own stop point. A landing hands the stop back when the plan no longer means to stop, when a lead is closer than the kiss can stop short of, when no room is left, or when the car keeps not slowing; the plan's
 request then passes unchanged, and if StarPilot's bit is already up LongControl's ramp continues from the request last sent. A plan
 asking to move ends a landing only when the plan is under way or StarPilot's bit is down; StarPilot's held bit then stays
 unpublished while the plan asks to move, unless the model says stop in Experimental mode. `forceDecel`, FCW, driver override and
