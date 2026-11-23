@@ -207,9 +207,10 @@ More braking than StarPilot asks comes only from an anti-stall press while the c
 StarPilot's stop bit is held back until the wheels have nearly stopped (0.10 m/s or the standstill flag), so the stopping ramp and
 the hold start at rest; the bit then stays up until the plan asks to move.
 
-Where the car rests stays StarPilot's, within a bound. Enhanced Stops, committed or approaching a light it tracks, never rests past
-its stop line as moved by Stop Distance Adjustment; today's Enhanced Stops stops end 1.5-3.4 m short of that line, so a landed one
-can end that much nearer it. Any other stop rests at most 0.5 m further on than where StarPilot's stopping ramp would have ended
+Where the car rests stays StarPilot's, within a bound. Enhanced Stops, committed or approaching a light it tracks, does not rest past
+its stop line as moved by Stop Distance Adjustment unless today's stop already would; then, on a weak brake, the landing hands the
+stop back and the car rests at most a few centimetres further past it than today (0.06 m in simulation). Today's Enhanced Stops
+stops end 1.5-3.4 m short of that line, so a landed one can end that much nearer it. Any other stop rests at most 0.5 m further on than where StarPilot's stopping ramp would have ended
 it, counted from the moment StarPilot's bit has stayed up 0.15 s; easing before that moment is not bounded, so the simulated worst
 case is 0.73 m. It never rests past the model's own stop point, and a radar lead always keeps 2 m after the actuator delay. Where the
 soft end no longer fits, the landing eases less. A landing hands the stop back when the plan no longer means to stop, asks 2 m/s²

@@ -24,9 +24,10 @@ from openpilot.starpilot.longitudinal.smooth_stops_preferences import supported
 # LongControl's stopping ramp and the car's standstill hold start at rest; at rest the plan passes and the bit stays up until the
 # plan asks to move.
 #
-# The rest point is bounded: an Enhanced Stops commitment never rests past its own stop point (the tracked line moved by its Stop
-# Distance Adjustment); any other stop rests at most LEEWAY further on than where StarPilot's stopping ramp would have ended it, and
-# never past the nearest point the model's request has asked to stop at, both fixed to the road. Where the soft tail no longer fits,
+# The rest point is bounded: an Enhanced Stops commitment does not rest past its own stop point (the tracked line moved by its Stop
+# Distance Adjustment) unless StarPilot's own stop already would, in which case the overrun hand-back returns the stop; any other
+# stop rests at most LEEWAY further on than where StarPilot's stopping ramp would have ended it, and never past the nearest point
+# the model's request has asked to stop at, both fixed to the road. Where the soft tail no longer fits,
 # the landing eases less, up to letting StarPilot's own request through unchanged. Whatever stops the car LEAD_STANDING_GAP short of
 # a radar lead passes as well. Anything a landing cannot absorb hands the stop back to StarPilot at once: the plan asking to move or
 # no longer meaning to stop, a demand of URGENT_DECEL or more, a lead closer than the kiss can stop short of, no room left inside
