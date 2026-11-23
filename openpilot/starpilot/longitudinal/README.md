@@ -211,12 +211,22 @@ the hold start at rest; the bit then stays up until the plan asks to move.
 Where the car rests stays StarPilot's, within a bound. Enhanced Stops, committed or approaching a light it tracks, does not rest past
 its stop line as moved by Stop Distance Adjustment unless today's stop already would; then, on a weak brake, the landing hands the
 stop back and the car rests at most a few centimetres further past it than today (0.06 m in simulation). Today's Enhanced Stops
-stops end 1.5-3.4 m short of that line, so a landed one can end that much nearer it. Any other stop rests at most 0.5 m further on than where StarPilot's stopping ramp would have ended
+stops end 1.5-3.4 m short of that line, so a landed one can end that much nearer it. That line is a countdown that can read short
+(on a logged drive it read 2 m or more short, and a stop committed at 5 m/s was handed back at 4 m/s to LongControl's ramp), so in
+Experimental mode, where the model's request places the stop further on, a committed stop may instead rest up to 0.5 m past where
+StarPilot's own stopping ramp would have ended it, read from how the car actually slows while the landing still sends StarPilot's
+own request, and never past the model's own stop point. Simulated with the line read 2-3 m short and the bit at 5 m/s, it rests
+0.3 m further on than today (0.5 m on a weak, creeping brake), braking at the wheel stop falls from 1.4-1.8 to 0.2-0.45 m/s², and
+peak deceleration does not rise. Any other stop rests at most 0.5 m further on than where StarPilot's stopping ramp would have ended
 it, counted from the moment StarPilot's bit has stayed up 0.15 s; easing before that moment is not bounded, so the simulated worst
 case is 0.73 m. It never rests past the model's own stop point, and a radar lead always keeps 2 m after the actuator delay. Where the
-soft end no longer fits, the landing eases less. A demand of 2 m/s² or more passes exactly as StarPilot would send it while it lasts (its stopping state keeps a request already below
-stopAccel); once it has eased under 1.8 m/s² the landing lets braking off at 1.5 m/s³ and takes the tail back, within the
-model's own stop point. A landing hands the stop back when the plan no longer means to stop, when a lead is closer than the kiss can stop short of, when no room is left, or when the car keeps not slowing; the plan's
+soft end no longer fits, the landing eases less. A demand of 2 m/s² or more passes as StarPilot would send it while the car is
+fast (its stopping state keeps a request already below stopAccel), but the car's braking in its last part is held to a fade at
+2 m/s³ that ends at the kiss at rest, sqrt(0.15² + 2·2·v), requested one actuator delay ahead, still within the bounds above and
+the braking a lead or Enhanced Stops' line needs. Simulated for a model stop held at 2.4 m/s² down to walking pace (as on a logged
+drive), it rests 0.13-0.19 m further on and braking at the wheel stop falls from 1.8-2.2 to 0.6-1.3 m/s²; a sudden model stop
+that already ends past what it stops for ends 0.13 m further past it. Once the demand has eased under 1.8 m/s² the landing lets
+braking off at 1.5 m/s³ and takes the tail back, within the model's own stop point. A landing hands the stop back when the plan no longer means to stop, when a lead is closer than the kiss can stop short of, when no room is left, or when the car keeps not slowing; the plan's
 request then passes unchanged, and if StarPilot's bit is already up LongControl's ramp continues from the request last sent. A plan
 asking to move ends a landing only when the plan is under way or StarPilot's bit is down; StarPilot's held bit then stays
 unpublished while the plan asks to move, unless the model says stop in Experimental mode. `forceDecel`, FCW, driver override and

@@ -5,7 +5,9 @@ KEY = 'SmoothStops'
 DESCRIPTION = ("Eases off the brakes through the last few feet of every stop so your car settles to a halt instead of lurching. " +
                "In simulation, stops behind a car ended about 5 inches further forward on average (at most 2.5 feet) and took " +
                "about half a second longer (at most 2.5 seconds); stops at lights and signs took 1.5 to 2.5 seconds longer (up to " +
-               "4.6 with a weak brake) and ended up to 7 feet nearer the stop line than today, never further past it than today. " +
+               "4.6 with a weak brake) and ended up to 7 feet nearer the stop line than today, never further past it than today " +
+               "except in Experimental mode when the model sees the stop further on (then at most 2 feet beyond where today's stop " +
+               "ends). Hard stops ease off at the very end and stop up to 8 inches further on. " +
                "Extra stopped-lead distance and Enhanced Stops' Stop Distance Adjustment pull stops back. Gas Hyundai, Kia and " +
                "Genesis vehicles with radar SCC.")
 
